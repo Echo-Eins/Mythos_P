@@ -440,3 +440,7 @@ flycheck_*.el
 
 /data/
 /.hf_datasets_cache/
+/.idea/Mythos_P.iml
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]1/shelved.patch
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]/shelved.patch
+/.idea/misc.xml
