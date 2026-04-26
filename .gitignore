@@ -428,3 +428,15 @@ flycheck_*.el
 # network security
 /network-security.data
 
+/.idea/vcs.xml
+/.idea/workspace.xml
+/.idea/shelf/Uncommitted_changes_before_revert__Changes_.xml
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]1/shelved.patch
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]/shelved.patch
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]1/shelved.patch
+/.idea/shelf/Uncommitted_changes_before_revert_[Changes]/shelved.patch
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/inspectionProfiles/Project_Default.xml
+
+/data/
+/.hf_datasets_cache/
