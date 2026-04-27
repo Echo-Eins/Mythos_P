@@ -1,0 +1,72 @@
+import torch
+
+from open_mythos.dense_lm import DenseLMConfig, OpenMythosDenseLM
+
+
+def tiny_config() -> DenseLMConfig:
+    return DenseLMConfig(
+        vocab_size=128,
+        dim=64,
+        n_heads=4,
+        n_kv_heads=None,
+        prelude_layers=1,
+        coda_layers=1,
+        max_loop_iters=2,
+        max_seq_len=32,
+        dropout=0.0,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+
+def test_forward_loss_shape():
+    cfg = tiny_config()
+    model = OpenMythosDenseLM(cfg)
+    input_ids = torch.randint(3, cfg.vocab_size, (2, 16))
+    labels = input_ids.clone()
+    out = model(input_ids, labels=labels, collect_stats=True)
+    assert out.logits.shape == (2, 16, cfg.vocab_size)
+    assert out.loss is not None
+    assert out.stats is not None
+    assert not torch.isnan(out.logits).any()
+
+
+def test_generate_no_cache():
+    cfg = tiny_config()
+    model = OpenMythosDenseLM(cfg).eval()
+    input_ids = torch.randint(3, cfg.vocab_size, (2, 8))
+    out = model.generate(
+        input_ids,
+        max_new_tokens=4,
+        n_loops=1,
+        do_sample=False,
+        eos_token_id=None,
+    )
+    assert out.shape == (2, 12)
+
+
+def test_lti_A_is_stable():
+    cfg = tiny_config()
+    model = OpenMythosDenseLM(cfg)
+    A = model.recurrent.injection.A()
+    assert A.min().item() > 0.0
+    assert A.max().item() < 1.0
+
+
+def test_forward_with_act_stats():
+    cfg = tiny_config()
+    cfg.use_act = True
+    cfg.act_threshold = 0.99
+    cfg.act_ponder_weight = 0.01
+    model = OpenMythosDenseLM(cfg)
+    input_ids = torch.randint(3, cfg.vocab_size, (2, 16))
+    labels = input_ids.clone()
+    out = model(input_ids, labels=labels, collect_stats=True)
+    assert out.logits.shape == (2, 16, cfg.vocab_size)
+    assert out.loss is not None
+    assert out.stats is not None
+    assert "act_expected_steps" in out.stats
+    assert "act_hard_steps" in out.stats
+    assert "act_ponder_loss" in out.stats
+    assert "act_loss" in out.stats
+    assert out.stats["act_expected_steps"].item() >= 1.0
