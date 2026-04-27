@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Forward trust_remote_code=True to datasets.load_dataset.",
     )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help=(
+            "Optional Hugging Face token. If omitted, uses HF_TOKEN or "
+            "HUGGINGFACE_HUB_TOKEN from the environment."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -92,10 +101,17 @@ def export_jsonl(out_dir: Path, ds: Dataset | DatasetDict) -> None:
         write_jsonl(jsonl_dir / "dataset.jsonl", ds)
 
 
+def resolve_hf_token(explicit_token: str | None) -> str | None:
+    if explicit_token:
+        return explicit_token
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    hf_token = resolve_hf_token(args.hf_token)
     load_kwargs: dict[str, Any] = {
         "path": DATASET_ID,
         "name": args.subset,
@@ -105,6 +121,8 @@ def main() -> None:
         load_kwargs["split"] = args.split
     if args.cache_dir is not None:
         load_kwargs["cache_dir"] = str(args.cache_dir)
+    if hf_token is not None:
+        load_kwargs["token"] = hf_token
 
     ds = load_dataset(**load_kwargs)
 
