@@ -103,3 +103,52 @@
 - Exact eval prompts with `Problem:\n{problem}\n\nSolution:\n`, matching the supervised generation prefix and excluding the target answer.
 - The evaluator extracts `\boxed{...}`, `Final answer:`, `####`, or the final non-empty line, then compares normalized exact answers.
 - Predictions can be written to JSONL with generated text, target, prediction, normalized forms, and prompt token count.
+
+# No-ACT 1024 Run Diagnosis
+
+- [x] Parse `logs/27_04_3_no act_1024` startup, train, eval, and exact-eval lines.
+- [x] Confirm optimizer stability and falling response-token validation loss.
+- [x] Identify sample packing without block-diagonal attention as a train/generation mismatch.
+- [x] Disable multi-sample packing by default for supervised math fine-tuning.
+- [x] Update diagnosis notes and next-run command.
+- [x] Verify syntax locally without importing torch runtime.
+
+## No-ACT 1024 Diagnosis Review
+
+- `logs/27_04_3_no act_1024` shows stable training: eval loss went `3.07 -> 1.62`, PPL `21.60 -> 5.04`.
+- Exact-eval failed because generation is repetitive and did not emit EOS in the inspected samples, not because optimizer was dead.
+- Root causes to address first: multi-sample causal packing mismatch, too-short 2000-step scratch run, and LR decay reaching the floor while the model was still improving.
+- Training now defaults to one sample per causal chunk; `--pack-samples` is opt-in only.
+
+# Full SOTA Gap Audit
+
+- [x] Re-read dense LM, shared modules, training, eval, and tests.
+- [x] Compare each implemented mechanism against modern decoder-only/MoE/SFT practice.
+- [x] Separate correctness bugs from quality/performance gaps.
+- [x] Produce a prioritized action plan before further training.
+
+## Full SOTA Gap Audit Review
+
+- Added `tasks/sota_gap_audit.md`.
+- Current train path is a dense baseline, not the full documented Mythos architecture.
+- MoE, MLA, KV-cache, and per-loop adapters are not yet integrated into `OpenMythosDenseLM`.
+- The next work should focus on generation/objective correctness before adding MoE/MLA.
+
+# Web UI, LTI, AdaNorm, And Body-117 Pass
+
+- [x] Review CERBER `app.py`, `live_monitor.py`, and `inference_diagnostics.py` for reusable monitoring patterns.
+- [x] Add structured train/eval/exact-eval JSONL metric events.
+- [x] Add explicit epoch accounting and optional `--max-epochs` train target.
+- [x] Add Mythos-specific Gradio/Plotly Web UI for metrics, recurrent diagnostics, generation diagnostics, and attention/label masks.
+- [x] Replace the active LTI update with bounded EMA-style input and delta injection.
+- [x] Add loop-conditioned AdaRMSNorm support without adding unused full-dim Ada projections to ordinary blocks.
+- [x] Raise the recommended no-ACT body configuration to about 120M body parameters.
+- [x] Verify Python syntax locally without importing torch runtime.
+
+## Web UI And LTI Review
+
+- `mythos_gui/app.py` launches a local monitor with live train/eval plots, LTI/loop RMS plots, exact-eval diagnostics, prediction JSONL inspection, OpenR1 causal/label mask inspection, and checkpoint summaries.
+- Training writes `metrics.jsonl` by default under `--out-dir`; exact-eval can append diagnostics with `--metrics-jsonl`.
+- Training logs `epochs_seen`, `target_epochs`, `current_epoch`, `epoch_progress`, and emits `epoch_end` events when the shuffled train loader is exhausted.
+- LTI now logs raw/effective input and delta gains so instability can be diagnosed from graphs instead of raw logs.
+- The recommended no-ACT command now uses `dim=1536`, `n_heads=24`, `prelude_layers=2`, `coda_layers=1`, and `ffn_hidden_dim=4352`, giving roughly 120M non-embedding body parameters.

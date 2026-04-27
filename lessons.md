@@ -9,3 +9,15 @@
 ## Supervised Math Runs Need Response-Only Loss
 
 - For OpenR1-style SFT, do not optimize the model to predict the problem header and prompt by default. Mask prompt tokens, keep loss on solution/answer tokens, avoid splitting one sample across independent chunks, and do not force EOS onto truncated reasoning traces.
+
+## Do Not Pack SFT Samples Without Attention Reset
+
+- Packing multiple supervised examples into one causal context can make validation perplexity look good while generation fails, because answer tokens attend to previous examples during training but not during standalone generation. Use one sample per causal chunk unless the model supports block-diagonal/reset attention masks.
+
+## Adaptive Layers Must Start As No-Ops
+
+- AdaNorm/adaptive modulation projections should be zero-initialized and protected from generic model initialization. Otherwise an adaptive layer changes the base model at step 0, making ablations against RMSNorm and old checkpoints harder to interpret.
+
+## Monitor Training With Structured Events
+
+- For long Spark runs, write JSONL metric events directly from train/eval/exact-eval instead of relying on raw log scraping. Include body parameter counts, LTI gains, loop RMS, generation EOS/hit-max/repetition stats, and exact-match summaries so the Web UI can diagnose quality without reading `tee` logs manually.

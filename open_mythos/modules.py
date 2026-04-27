@@ -154,6 +154,7 @@ class RecurrentConfig:
     dropout: float = 0.0
     rope_theta: float = 500_000.0
     act_threshold: float = 0.99
+    use_ada_norm: bool = False
 
 
 def _require(condition: bool, message: str) -> None:
@@ -184,10 +185,58 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del cond
         rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         weight = self.weight.to(device=x.device, dtype=x.dtype)
         return (x.float() * rms).to(dtype=x.dtype) * weight
+
+
+class AdaRMSNorm(nn.Module):
+    """
+    RMSNorm with optional adaptive scale/shift conditioning.
+
+    With cond=None it is an ordinary RMSNorm.  With cond supplied, a zero-
+    initialized projection predicts per-channel scale and shift, so the module
+    starts identical to RMSNorm and learns adaptive modulation only if useful.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        *,
+        cond_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.cond_dim = cond_dim
+        self.ada_proj = nn.Linear(cond_dim, 2 * dim, bias=True) if cond_dim is not None else None
+        if self.ada_proj is not None:
+            self.ada_proj._open_mythos_zero_init = True
+            nn.init.zeros_(self.ada_proj.weight)
+            nn.init.zeros_(self.ada_proj.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        weight = self.weight.to(device=x.device, dtype=x.dtype)
+        y = (x.float() * rms).to(dtype=x.dtype) * weight
+        if cond is None or self.ada_proj is None:
+            return y
+        if cond.ndim == 2:
+            cond = cond.unsqueeze(1)
+        _require(cond.ndim == 3, "AdaRMSNorm cond must have shape (B, T, C) or (B, C)")
+        shift, scale = self.ada_proj(cond.to(dtype=x.dtype)).chunk(2, dim=-1)
+        return y * (1.0 + scale) + shift
 
 
 # ---------------------------------------------------------------------------
@@ -778,11 +827,23 @@ class DenseTransformerBlock(nn.Module):
         ffn_cfg: FFNConfig,
         *,
         norm_eps: float = 1e-6,
+        use_ada_norm: bool = False,
+        ada_cond_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         _require(attn_cfg.dim == ffn_cfg.dim, "attention and FFN dims must match")
-        self.attn_norm = RMSNorm(attn_cfg.dim, norm_eps)
-        self.ffn_norm = RMSNorm(attn_cfg.dim, norm_eps)
+        norm_cls = AdaRMSNorm if use_ada_norm else RMSNorm
+        cond_dim = ada_cond_dim if use_ada_norm else None
+        self.attn_norm = (
+            norm_cls(attn_cfg.dim, norm_eps, cond_dim=cond_dim)
+            if use_ada_norm
+            else norm_cls(attn_cfg.dim, norm_eps)
+        )
+        self.ffn_norm = (
+            norm_cls(attn_cfg.dim, norm_eps, cond_dim=cond_dim)
+            if use_ada_norm
+            else norm_cls(attn_cfg.dim, norm_eps)
+        )
         self.attn = DenseCausalSelfAttention(attn_cfg)
         self.ffn = SwiGLUFFN(ffn_cfg)
 
@@ -793,14 +854,15 @@ class DenseTransformerBlock(nn.Module):
         cache: Optional[KVCache] = None,
         layer_key: str = "block",
         start_pos: int = 0,
+        norm_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.attn(
-            self.attn_norm(x),
+            self.attn_norm(x, norm_cond),
             cache=cache,
             layer_key=f"{layer_key}.attn",
             start_pos=start_pos,
         )
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.ffn(self.ffn_norm(x, norm_cond))
         return x
 
     def forward_delta(
@@ -810,12 +872,14 @@ class DenseTransformerBlock(nn.Module):
         cache: Optional[KVCache] = None,
         layer_key: str = "block",
         start_pos: int = 0,
+        norm_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.forward(
             x,
             cache=cache,
             layer_key=layer_key,
             start_pos=start_pos,
+            norm_cond=norm_cond,
         ) - x
 
 
@@ -830,7 +894,7 @@ class LTIInjection(nn.Module):
 
     The intended recurrent update is:
 
-        h_{t+1} = A * h_t + B * e + delta_t
+        h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
 
     h_t:
         Current recurrent hidden state.
@@ -841,11 +905,10 @@ class LTIInjection(nn.Module):
         a residual block.
 
     A is parameterized as exp(-exp(log_dt + log_A)), so every channel lies in
-    (0, 1).  B is parameterized as max_input_gain * tanh(raw_input_gain), which
-    keeps prompt injection bounded while still allowing positive or negative
-    channel-wise mixing.  This stabilizes the linear part of the recurrence.  It
-    does not by itself guarantee global nonlinear stability; you still need norm
-    logging, gradient clipping, and sensible residual scaling during training.
+    (0, 1).  The input and delta gains are bounded and multiplied by (1 - A).
+    This makes the discrete update an exponential moving state transition
+    rather than an unconstrained residual add.  The nonlinear transformer delta
+    can still be large, but it is now explicitly gain-limited before injection.
     """
 
     def __init__(
@@ -853,28 +916,44 @@ class LTIInjection(nn.Module):
         dim: int,
         *,
         init_log_a: float = 0.0,
-        init_log_dt: float = 0.0,
-        init_input_gain: float = 0.1,
+        init_log_dt: float = -2.0,
+        init_input_gain: float = 1.0,
+        init_delta_gain: float = 0.35,
         max_input_gain: float = 1.0,
+        max_delta_gain: float = 1.0,
     ) -> None:
         super().__init__()
         _require(max_input_gain > 0.0, "max_input_gain must be positive")
+        _require(max_delta_gain > 0.0, "max_delta_gain must be positive")
         _require(
-            abs(init_input_gain) < max_input_gain,
-            "abs(init_input_gain) must be smaller than max_input_gain",
+            abs(init_input_gain) <= max_input_gain,
+            "abs(init_input_gain) must not exceed max_input_gain",
+        )
+        _require(
+            abs(init_delta_gain) <= max_delta_gain,
+            "abs(init_delta_gain) must not exceed max_delta_gain",
         )
         self.log_A = nn.Parameter(torch.full((dim,), init_log_a))
         self.log_dt = nn.Parameter(torch.tensor(float(init_log_dt)))
-        raw_gain = math.atanh(init_input_gain / max_input_gain)
-        self.raw_input_gain = nn.Parameter(torch.full((dim,), raw_gain))
+        input_ratio = max(-0.999, min(0.999, init_input_gain / max_input_gain))
+        delta_ratio = max(-0.999, min(0.999, init_delta_gain / max_delta_gain))
+        self.raw_input_gain = nn.Parameter(torch.full((dim,), math.atanh(input_ratio)))
+        self.raw_delta_gain = nn.Parameter(torch.full((dim,), math.atanh(delta_ratio)))
         self.max_input_gain = max_input_gain
+        self.max_delta_gain = max_delta_gain
 
     def A(self) -> torch.Tensor:
         exponent = (self.log_dt + self.log_A).clamp(min=-20.0, max=20.0)
         return torch.exp(-torch.exp(exponent))
 
     def B(self) -> torch.Tensor:
+        return self.input_gain()
+
+    def input_gain(self) -> torch.Tensor:
         return self.max_input_gain * torch.tanh(self.raw_input_gain)
+
+    def delta_gain(self) -> torch.Tensor:
+        return self.max_delta_gain * torch.tanh(self.raw_delta_gain)
 
     def forward(
         self,
@@ -884,8 +963,11 @@ class LTIInjection(nn.Module):
     ) -> torch.Tensor:
         _require(h.shape == e.shape == delta.shape, "h, e, and delta shapes must match")
         A = self.A().to(dtype=h.dtype, device=h.device)
-        B = self.B().to(dtype=h.dtype, device=h.device)
-        return A.view(1, 1, -1) * h + B.view(1, 1, -1) * e + delta
+        one_minus_A = (1.0 - A).clamp(min=0.0, max=1.0)
+        input_gain = self.input_gain().to(dtype=h.dtype, device=h.device)
+        delta_gain = self.delta_gain().to(dtype=h.dtype, device=h.device)
+        drive = input_gain.view(1, 1, -1) * e + delta_gain.view(1, 1, -1) * delta
+        return A.view(1, 1, -1) * h + one_minus_A.view(1, 1, -1) * drive
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1225,7 @@ class DenseRecurrentBlock(nn.Module):
 
         base_t  = norm(h_t + e + loop_embedding(t))
         delta_t = TransformerBlock(base_t) - base_t
-        h_{t+1} = A * h_t + B * e + delta_t
+        h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
 
     The key decision is using the transformer's residual delta rather than its
     full output.  LTI injection already carries the previous hidden state and
@@ -1160,7 +1242,11 @@ class DenseRecurrentBlock(nn.Module):
 
         self.cfg = cfg
         self.loop_dim = loop_dim
-        self.norm = RMSNorm(cfg.dim, norm_eps)
+        self.norm = (
+            AdaRMSNorm(cfg.dim, norm_eps, cond_dim=loop_dim)
+            if cfg.use_ada_norm
+            else RMSNorm(cfg.dim, norm_eps)
+        )
         self.block = DenseTransformerBlock(
             AttentionConfig(
                 dim=cfg.dim,
@@ -1175,6 +1261,8 @@ class DenseRecurrentBlock(nn.Module):
                 dropout=cfg.dropout,
             ),
             norm_eps=norm_eps,
+            use_ada_norm=cfg.use_ada_norm,
+            ada_cond_dim=loop_dim,
         )
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
@@ -1198,12 +1286,14 @@ class DenseRecurrentBlock(nn.Module):
 
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
-            base = self.norm(h_loop + e)
+            norm_cond = (h_loop - h)[..., : self.loop_dim]
+            base = self.norm(h_loop + e, norm_cond)
             delta = self.block.forward_delta(
                 base,
                 cache=cache,
                 layer_key=f"{layer_key}.loop_{loop_index}",
                 start_pos=start_pos,
+                norm_cond=norm_cond,
             )
             h = self.injection(h, e, delta)
 
@@ -1232,7 +1322,10 @@ def init_weights(module: nn.Module, *, std: float = 0.02) -> None:
     """
 
     if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if getattr(module, "_open_mythos_zero_init", False):
+            nn.init.zeros_(module.weight)
+        else:
+            nn.init.normal_(module.weight, mean=0.0, std=std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):

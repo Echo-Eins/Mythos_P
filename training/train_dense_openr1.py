@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     exact_eval.add_argument("--sample", action="store_true")
     exact_eval.add_argument("--log-every", type=int, default=10)
     exact_eval.add_argument("--predictions-path", type=Path, default=None)
+    exact_eval.add_argument("--metrics-jsonl", type=Path, default=None)
     exact_eval.add_argument("--print-samples", type=int, default=5)
     exact_eval.add_argument("--device", default="cuda")
     exact_eval.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
@@ -137,19 +138,35 @@ def add_data_args(
         default=16,
         help="Skip samples that produce fewer supervised response tokens.",
     )
+    parser.add_argument(
+        "--pack-samples",
+        action="store_true",
+        help=(
+            "Pack multiple samples into one causal chunk. Faster, but answer "
+            "tokens can attend to previous samples unless block-diagonal masks "
+            "are added; keep disabled for exact supervised math runs."
+        ),
+    )
 
 
 def add_model_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dim", type=int, default=1024)
-    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--dim", type=int, default=1536)
+    parser.add_argument("--n-heads", type=int, default=24)
     parser.add_argument("--n-kv-heads", type=int, default=None)
-    parser.add_argument("--prelude-layers", type=int, default=1)
+    parser.add_argument("--prelude-layers", type=int, default=2)
     parser.add_argument("--coda-layers", type=int, default=1)
     parser.add_argument("--max-loop-iters", type=int, default=4)
     parser.add_argument("--train-loops", type=int, default=None)
-    parser.add_argument("--ffn-hidden-dim", type=int, default=None)
+    parser.add_argument("--ffn-hidden-dim", type=int, default=4352)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--rope-theta", type=float, default=500_000.0)
+    parser.add_argument("--ada-norm", dest="use_ada_norm", action="store_true", default=True)
+    parser.add_argument("--no-ada-norm", dest="use_ada_norm", action="store_false")
+    parser.add_argument("--lti-init-log-dt", type=float, default=-2.0)
+    parser.add_argument("--lti-init-input-gain", type=float, default=1.0)
+    parser.add_argument("--lti-init-delta-gain", type=float, default=0.35)
+    parser.add_argument("--lti-max-input-gain", type=float, default=1.0)
+    parser.add_argument("--lti-max-delta-gain", type=float, default=1.0)
     parser.add_argument("--use-act", action="store_true")
     parser.add_argument("--act-threshold", type=float, default=0.99)
     parser.add_argument("--act-ponder-weight", type=float, default=0.01)
@@ -164,6 +181,16 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument(
+        "--max-epochs",
+        type=float,
+        default=None,
+        help=(
+            "Optional epoch-based training target. If set, --max-steps is "
+            "computed after dataset filtering as "
+            "ceil(max_epochs * train_batches_per_epoch / grad_accum)."
+        ),
+    )
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--eval-batches", type=int, default=50)
@@ -189,6 +216,7 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--metrics-jsonl", type=Path, default=None)
     parser.add_argument("--compile", action="store_true")
 
 
@@ -420,6 +448,21 @@ def answers_exact_match(predicted: str, target: str) -> bool:
     return pred_num is not None and target_num is not None and pred_num == target_num
 
 
+def repeated_ngram_ratio(token_ids: list[int], n: int = 4) -> float:
+    if len(token_ids) < n:
+        return 0.0
+    ngrams = [tuple(token_ids[idx : idx + n]) for idx in range(len(token_ids) - n + 1)]
+    if not ngrams:
+        return 0.0
+    return 1.0 - (len(set(ngrams)) / len(ngrams))
+
+
+def unique_token_ratio(token_ids: list[int]) -> float:
+    if not token_ids:
+        return 0.0
+    return len(set(token_ids)) / len(token_ids)
+
+
 def build_token_sequences(
     ds: Dataset,
     tokenizer,
@@ -509,6 +552,7 @@ class PackedCausalDataset(TorchDataset):
         *,
         seq_len: int,
         pad_token_id: int,
+        pack_samples: bool = False,
     ) -> None:
         self.seq_len = seq_len
         self.pad_token_id = pad_token_id
@@ -521,6 +565,18 @@ class PackedCausalDataset(TorchDataset):
             if len(ids) < 2 or sum(mask[1:]) == 0:
                 return
             self.chunks.append((ids, mask))
+
+        if not pack_samples:
+            for seq in sequences:
+                if len(seq.ids) != len(seq.label_mask):
+                    raise ValueError("token ids and label mask must have the same length")
+                if len(seq.ids) > seq_len + 1:
+                    raise ValueError("sequence length exceeds packed chunk length")
+                pad_count = seq_len + 1 - len(seq.ids)
+                padded_ids = seq.ids + [pad_token_id] * pad_count
+                padded_mask = seq.label_mask + [0] * pad_count
+                append_chunk(padded_ids, padded_mask)
+            return
 
         def flush_padded() -> None:
             nonlocal token_buffer, mask_buffer
@@ -596,8 +652,18 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
         seed=args.seed,
     )
     pad_id = tokenizer.pad_token_id
-    train_ds = PackedCausalDataset(train_seq, seq_len=args.max_seq_len, pad_token_id=pad_id)
-    val_ds = PackedCausalDataset(val_seq, seq_len=args.max_seq_len, pad_token_id=pad_id)
+    train_ds = PackedCausalDataset(
+        train_seq,
+        seq_len=args.max_seq_len,
+        pad_token_id=pad_id,
+        pack_samples=args.pack_samples,
+    )
+    val_ds = PackedCausalDataset(
+        val_seq,
+        seq_len=args.max_seq_len,
+        pad_token_id=pad_id,
+        pack_samples=args.pack_samples,
+    )
     if len(train_ds) == 0:
         raise ValueError("training dataset has zero chunks")
     if len(val_ds) == 0:
@@ -634,6 +700,12 @@ def make_model_config(args: argparse.Namespace, tokenizer) -> DenseLMConfig:
         ffn_hidden_dim=args.ffn_hidden_dim,
         dropout=args.dropout,
         rope_theta=args.rope_theta,
+        use_ada_norm=args.use_ada_norm,
+        lti_init_log_dt=args.lti_init_log_dt,
+        lti_init_input_gain=args.lti_init_input_gain,
+        lti_init_delta_gain=args.lti_init_delta_gain,
+        lti_max_input_gain=args.lti_max_input_gain,
+        lti_max_delta_gain=args.lti_max_delta_gain,
         use_act=args.use_act,
         act_threshold=args.act_threshold,
         act_ponder_weight=args.act_ponder_weight,
@@ -737,11 +809,33 @@ def load_checkpoint(
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = dense_lm_config_from_dict(ckpt["config"])
     model = OpenMythosDenseLM(cfg)
-    model.load_state_dict(ckpt["model"])
+    load_model_state_compat(model, ckpt["model"])
     model.to(device=device)
     if dtype != torch.float32:
         model.to(dtype=dtype)
     return model, ckpt
+
+
+def load_model_state_compat(model: OpenMythosDenseLM, state: dict[str, torch.Tensor]) -> None:
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    allowed_missing = {
+        name for name in missing if name.endswith("injection.raw_delta_gain")
+    }
+    real_missing = [name for name in missing if name not in allowed_missing]
+    if real_missing or unexpected:
+        details = {"missing": real_missing, "unexpected": list(unexpected)}
+        raise RuntimeError(f"checkpoint state is incompatible: {json.dumps(details)}")
+    if allowed_missing:
+        print(
+            json.dumps(
+                {
+                    "checkpoint_warning": "initialized new LTI delta gain parameters",
+                    "missing": sorted(allowed_missing),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -759,6 +853,55 @@ def scalar_stat(stats: dict[str, Any], key: str) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def json_safe(value: Any) -> Any:
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            return float(value)
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return None
+    return value
+
+
+def append_jsonl(path: Optional[Path], payload: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {"time": time.time(), **payload}
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(json_safe(event), ensure_ascii=False) + "\n")
+
+
+def epoch_metrics(
+    *,
+    micro_batches_seen: int,
+    train_batches_per_epoch: int,
+    max_steps: int,
+    grad_accum: int,
+) -> dict[str, float | int]:
+    if train_batches_per_epoch <= 0:
+        raise ValueError("train_batches_per_epoch must be positive")
+    updates_per_epoch = train_batches_per_epoch / max(1, grad_accum)
+    target_epochs = max_steps / max(updates_per_epoch, 1e-12)
+    epochs_seen = micro_batches_seen / train_batches_per_epoch
+    return {
+        "epochs_seen": epochs_seen,
+        "current_epoch": int(math.floor(epochs_seen)) + 1,
+        "epoch_progress": epochs_seen - math.floor(epochs_seen),
+        "target_epochs": target_epochs,
+        "updates_per_epoch": updates_per_epoch,
+    }
 
 
 @torch.no_grad()
@@ -812,6 +955,13 @@ def evaluate(
     }
     if first_stats is not None:
         for key in (
+            "lti_A_min",
+            "lti_A_max",
+            "lti_B_abs_max",
+            "lti_input_gain_abs_max",
+            "lti_delta_gain_abs_max",
+            "lti_effective_input_abs_max",
+            "lti_effective_delta_abs_max",
             "act_loss",
             "act_ponder_loss",
             "act_expected_steps",
@@ -836,6 +986,17 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("train requires --tokenizer")
     tokenizer = load_tokenizer(args.tokenizer)
     train_loader, val_loader = build_loaders(args, tokenizer)
+    train_batches_per_epoch = len(train_loader)
+    if train_batches_per_epoch <= 0:
+        raise ValueError("training loader has zero batches; reduce --batch-size")
+    train_chunks_per_epoch = train_batches_per_epoch * args.batch_size
+    if args.max_epochs is not None:
+        if args.max_epochs <= 0.0:
+            raise ValueError("--max-epochs must be positive when provided")
+        args.max_steps = max(
+            1,
+            int(math.ceil(args.max_epochs * train_batches_per_epoch / args.grad_accum)),
+        )
 
     cfg = make_model_config(args, tokenizer)
     model = OpenMythosDenseLM(cfg).to(device)
@@ -854,7 +1015,7 @@ def train(args: argparse.Namespace) -> None:
     if args.resume is not None:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-        base_model.load_state_dict(ckpt["model"])
+        load_model_state_compat(base_model, ckpt["model"])
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -868,35 +1029,58 @@ def train(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
 
-    print(
-        json.dumps(
-            {
-                "params": (model._orig_mod if hasattr(model, "_orig_mod") else model).num_parameters(),
-                "train_chunks": len(train_loader.dataset),
-                "val_chunks": len(val_loader.dataset),
-                "data": getattr(args, "data_stats", None),
-                "device": str(device),
-                "dtype": args.dtype,
-                "seed": args.seed,
-                "max_seq_len": args.max_seq_len,
-                "batch_size": args.batch_size,
-                "grad_accum": args.grad_accum,
-                "effective_batch_chunks": args.batch_size * args.grad_accum,
-                "loss_on": args.loss_on,
-                "long_sample_policy": args.long_sample_policy,
-                "min_response_tokens": args.min_response_tokens,
-                "train_loops": args.train_loops,
-                "lr_schedule": args.lr_schedule,
-                "base_lr": args.lr,
-                "min_lr": args.lr * args.min_lr_ratio,
-                "decay_steps": args.decay_steps or args.max_steps,
-            },
-            indent=2,
-        ),
-        flush=True,
+    metrics_path = args.metrics_jsonl or (args.out_dir / "metrics.jsonl")
+    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    start_micro_batches_seen = start_step * args.grad_accum
+    start_epoch_metrics = epoch_metrics(
+        micro_batches_seen=start_micro_batches_seen,
+        train_batches_per_epoch=train_batches_per_epoch,
+        max_steps=args.max_steps,
+        grad_accum=args.grad_accum,
     )
+    startup_payload = {
+        "event": "startup",
+        "params": base_model.num_parameters(),
+        "parameter_breakdown": base_model.parameter_breakdown(),
+        "train_chunks": len(train_loader.dataset),
+        "val_chunks": len(val_loader.dataset),
+        "train_batches_per_epoch": train_batches_per_epoch,
+        "train_chunks_per_epoch": train_chunks_per_epoch,
+        "max_epochs": args.max_epochs,
+        **start_epoch_metrics,
+        "data": getattr(args, "data_stats", None),
+        "device": str(device),
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "max_seq_len": args.max_seq_len,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "effective_batch_chunks": args.batch_size * args.grad_accum,
+        "loss_on": args.loss_on,
+        "long_sample_policy": args.long_sample_policy,
+        "min_response_tokens": args.min_response_tokens,
+        "pack_samples": args.pack_samples,
+        "dim": cfg.dim,
+        "n_heads": cfg.n_heads,
+        "ffn_hidden_dim": cfg.resolved_ffn_hidden_dim(),
+        "prelude_layers": cfg.prelude_layers,
+        "coda_layers": cfg.coda_layers,
+        "max_loop_iters": cfg.max_loop_iters,
+        "train_loops": args.train_loops,
+        "use_ada_norm": cfg.use_ada_norm,
+        "use_act": cfg.use_act,
+        "lr_schedule": args.lr_schedule,
+        "base_lr": args.lr,
+        "min_lr": args.lr * args.min_lr_ratio,
+        "decay_steps": args.decay_steps or args.max_steps,
+        "config": asdict(cfg),
+    }
+    print(json.dumps(startup_payload, ensure_ascii=False, indent=2), flush=True)
+    append_jsonl(metrics_path, startup_payload)
 
     data_iter = iter(train_loader)
+    micro_batches_seen = start_micro_batches_seen
+    completed_epoch_events = int(micro_batches_seen // train_batches_per_epoch)
     running_loss = 0.0
     running_tokens = 0
     t0 = time.perf_counter()
@@ -913,8 +1097,27 @@ def train(args: argparse.Namespace) -> None:
             try:
                 batch = next(data_iter)
             except StopIteration:
+                completed = int(micro_batches_seen // train_batches_per_epoch)
+                if completed > completed_epoch_events:
+                    completed_epoch_events = completed
+                    event = {
+                        "event": "epoch_end",
+                        "step": step + 1,
+                        "completed_epochs": completed,
+                        "micro_batches_seen": micro_batches_seen,
+                        "chunks_seen": micro_batches_seen * args.batch_size,
+                        **epoch_metrics(
+                            micro_batches_seen=micro_batches_seen,
+                            train_batches_per_epoch=train_batches_per_epoch,
+                            max_steps=args.max_steps,
+                            grad_accum=args.grad_accum,
+                        ),
+                    }
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                    append_jsonl(metrics_path, event)
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
+            micro_batches_seen += 1
             token_count = int((batch["labels"] != -100).sum().item())
             if token_count == 0:
                 continue
@@ -960,6 +1163,14 @@ def train(args: argparse.Namespace) -> None:
                 "lr": scheduler.get_last_lr()[0],
                 "grad_norm": float(grad_norm),
                 "tok_s": tok_s,
+                "micro_batches_seen": micro_batches_seen,
+                "chunks_seen": micro_batches_seen * args.batch_size,
+                **epoch_metrics(
+                    micro_batches_seen=micro_batches_seen,
+                    train_batches_per_epoch=train_batches_per_epoch,
+                    max_steps=args.max_steps,
+                    grad_accum=args.grad_accum,
+                ),
             }
             if device.type == "cuda":
                 log["cuda_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
@@ -968,6 +1179,10 @@ def train(args: argparse.Namespace) -> None:
                     "lti_A_min",
                     "lti_A_max",
                     "lti_B_abs_max",
+                    "lti_input_gain_abs_max",
+                    "lti_delta_gain_abs_max",
+                    "lti_effective_input_abs_max",
+                    "lti_effective_delta_abs_max",
                     "lm_loss",
                     "act_loss",
                     "act_ponder_loss",
@@ -985,6 +1200,7 @@ def train(args: argparse.Namespace) -> None:
                         for x in stats["recurrent_loop_rms"].detach().cpu()
                     ]
             print(json.dumps(log, ensure_ascii=False), flush=True)
+            append_jsonl(metrics_path, {"event": "train", **log})
             running_loss = 0.0
             running_tokens = 0
             t0 = time.perf_counter()
@@ -998,19 +1214,52 @@ def train(args: argparse.Namespace) -> None:
                 n_loops=args.train_loops,
                 max_batches=args.eval_batches,
             )
-            print(json.dumps({"step": step_num, "eval": metrics}, ensure_ascii=False), flush=True)
+            eval_payload = {
+                "event": "eval",
+                "step": step_num,
+                "eval": metrics,
+                **epoch_metrics(
+                    micro_batches_seen=micro_batches_seen,
+                    train_batches_per_epoch=train_batches_per_epoch,
+                    max_steps=args.max_steps,
+                    grad_accum=args.grad_accum,
+                ),
+            }
+            print(
+                json.dumps(
+                    {key: value for key, value in eval_payload.items() if key != "event"},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            append_jsonl(metrics_path, eval_payload)
             model.train()
 
         if step_num % args.save_every == 0:
             base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            checkpoint_path = args.out_dir / f"step_{step_num:07d}.pt"
             save_checkpoint(
-                args.out_dir / f"step_{step_num:07d}.pt",
+                checkpoint_path,
                 model=base_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step_num,
                 tokenizer_id=args.tokenizer,
                 args=args,
+            )
+            append_jsonl(
+                metrics_path,
+                {
+                    "event": "checkpoint",
+                    "step": step_num,
+                    "path": checkpoint_path,
+                    **epoch_metrics(
+                        micro_batches_seen=micro_batches_seen,
+                        train_batches_per_epoch=train_batches_per_epoch,
+                        max_steps=args.max_steps,
+                        grad_accum=args.grad_accum,
+                    ),
+                },
             )
 
     base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1022,6 +1271,21 @@ def train(args: argparse.Namespace) -> None:
         step=args.max_steps,
         tokenizer_id=args.tokenizer,
         args=args,
+    )
+    append_jsonl(
+        metrics_path,
+        {
+            "event": "checkpoint",
+            "step": args.max_steps,
+            "path": args.out_dir / "final.pt",
+            "final": True,
+            **epoch_metrics(
+                micro_batches_seen=micro_batches_seen,
+                train_batches_per_epoch=train_batches_per_epoch,
+                max_steps=args.max_steps,
+                grad_accum=args.grad_accum,
+            ),
+        },
     )
 
 
@@ -1070,25 +1334,22 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
         args.predictions_path.parent.mkdir(parents=True, exist_ok=True)
         pred_fp = args.predictions_path.open("w", encoding="utf-8")
 
-    print(
-        json.dumps(
-            {
-                "checkpoint": str(args.checkpoint),
-                "tokenizer": tokenizer_id,
-                "samples": len(raw),
-                "prompt_format": "Problem:\\n{problem}\\n\\nSolution:\\n",
-                "max_new_tokens": args.max_new_tokens,
-                "n_loops": args.n_loops,
-                "sample": args.sample,
-                "temperature": args.temperature,
-                "top_k": args.top_k,
-                "top_p": args.top_p,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        flush=True,
-    )
+    start_payload = {
+        "event": "exact_eval_start",
+        "checkpoint": str(args.checkpoint),
+        "tokenizer": tokenizer_id,
+        "samples": len(raw),
+        "prompt_format": "Problem:\\n{problem}\\n\\nSolution:\\n",
+        "max_new_tokens": args.max_new_tokens,
+        "n_loops": args.n_loops,
+        "sample": args.sample,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "predictions_path": args.predictions_path,
+    }
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+    append_jsonl(args.metrics_jsonl, start_payload)
 
     evaluated = 0
     correct = 0
@@ -1096,6 +1357,10 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
     skipped_no_prompt = 0
     skipped_too_long = 0
     generated_tokens = 0
+    eos_count = 0
+    hit_max_count = 0
+    repeat_4gram_sum = 0.0
+    unique_token_ratio_sum = 0.0
     printed = 0
 
     try:
@@ -1134,7 +1399,18 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
                 eos_token_id=tokenizer.eos_token_id,
             )
             gen_ids = out[0, prompt_tokens:]
-            generated_tokens += int(gen_ids.numel())
+            gen_list = [int(x) for x in gen_ids.detach().cpu().tolist()]
+            generated_count = len(gen_list)
+            eos_emitted = tokenizer.eos_token_id is not None and tokenizer.eos_token_id in gen_list
+            hit_max_new_tokens = generated_count >= args.max_new_tokens and not eos_emitted
+            repeat_4gram = repeated_ngram_ratio(gen_list, n=4)
+            unique_ratio = unique_token_ratio(gen_list)
+
+            generated_tokens += generated_count
+            eos_count += int(eos_emitted)
+            hit_max_count += int(hit_max_new_tokens)
+            repeat_4gram_sum += repeat_4gram
+            unique_token_ratio_sum += unique_ratio
             generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
             prediction = extract_final_answer(generated_text)
             is_correct = answers_exact_match(prediction, target)
@@ -1151,11 +1427,29 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
                 "target_norm": normalize_answer(target),
                 "prediction_norm": normalize_answer(prediction),
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": int(gen_ids.numel()),
+                "generated_tokens": generated_count,
+                "eos_emitted": eos_emitted,
+                "hit_max_new_tokens": hit_max_new_tokens,
+                "repeat_4gram_ratio": repeat_4gram,
+                "unique_token_ratio": unique_ratio,
                 "generated_text": generated_text,
             }
             if pred_fp is not None:
                 pred_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl(
+                args.metrics_jsonl,
+                {
+                    "event": "exact_sample",
+                    "row_idx": row_idx,
+                    "exact": is_correct,
+                    "prompt_tokens": prompt_tokens,
+                    "generated_tokens": generated_count,
+                    "eos_emitted": eos_emitted,
+                    "hit_max_new_tokens": hit_max_new_tokens,
+                    "repeat_4gram_ratio": repeat_4gram,
+                    "unique_token_ratio": unique_ratio,
+                },
+            )
 
             if printed < args.print_samples:
                 print(json.dumps({"sample": record}, ensure_ascii=False), flush=True)
@@ -1168,6 +1462,9 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
                             "evaluated": evaluated,
                             "correct": correct,
                             "exact_match": correct / max(1, evaluated),
+                            "eos_rate": eos_count / max(1, evaluated),
+                            "hit_max_new_tokens_rate": hit_max_count / max(1, evaluated),
+                            "avg_repeat_4gram_ratio": repeat_4gram_sum / max(1, evaluated),
                         },
                         ensure_ascii=False,
                     ),
@@ -1185,8 +1482,13 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
         "skipped_no_prompt": skipped_no_prompt,
         "skipped_too_long": skipped_too_long,
         "avg_generated_tokens": generated_tokens / max(1, evaluated),
+        "eos_rate": eos_count / max(1, evaluated),
+        "hit_max_new_tokens_rate": hit_max_count / max(1, evaluated),
+        "avg_repeat_4gram_ratio": repeat_4gram_sum / max(1, evaluated),
+        "avg_unique_token_ratio": unique_token_ratio_sum / max(1, evaluated),
     }
     print(json.dumps({"exact_eval": metrics}, ensure_ascii=False, indent=2), flush=True)
+    append_jsonl(args.metrics_jsonl, {"event": "exact_eval", "exact_eval": metrics})
 
 
 def read_prompt(args: argparse.Namespace) -> str:

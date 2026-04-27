@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from open_mythos.modules import (
     ACTAccumulator,
     ACTHalting,
+    AdaRMSNorm,
     AttentionConfig,
     DenseTransformerBlock,
     FFNConfig,
@@ -42,10 +43,10 @@ class DenseLMConfig:
     """
 
     vocab_size: int
-    dim: int = 1024
-    n_heads: int = 8
+    dim: int = 1536
+    n_heads: int = 24
     n_kv_heads: Optional[int] = None
-    prelude_layers: int = 1
+    prelude_layers: int = 2
     coda_layers: int = 1
     max_loop_iters: int = 4
     max_seq_len: int = 2048
@@ -54,6 +55,12 @@ class DenseLMConfig:
     dropout: float = 0.0
     rope_theta: float = 500_000.0
     norm_eps: float = 1e-6
+    use_ada_norm: bool = True
+    lti_init_log_dt: float = -2.0
+    lti_init_input_gain: float = 1.0
+    lti_init_delta_gain: float = 0.35
+    lti_max_input_gain: float = 1.0
+    lti_max_delta_gain: float = 1.0
     tie_embeddings: bool = True
     init_std: float = 0.02
     use_act: bool = False
@@ -85,10 +92,22 @@ class DenseLMConfig:
             raise ValueError("n_kv_heads must divide n_heads")
         if self.prelude_layers < 0 or self.coda_layers < 0:
             raise ValueError("prelude_layers and coda_layers must be non-negative")
+        if self.ffn_hidden_dim is not None and self.ffn_hidden_dim <= 0:
+            raise ValueError("ffn_hidden_dim must be positive")
+        if self.loop_dim is not None and self.loop_dim <= 0:
+            raise ValueError("loop_dim must be positive")
         if self.max_loop_iters <= 0:
             raise ValueError("max_loop_iters must be positive")
         if self.max_seq_len <= 1:
             raise ValueError("max_seq_len must be > 1")
+        if self.lti_max_input_gain <= 0.0:
+            raise ValueError("lti_max_input_gain must be positive")
+        if self.lti_max_delta_gain <= 0.0:
+            raise ValueError("lti_max_delta_gain must be positive")
+        if abs(self.lti_init_input_gain) > self.lti_max_input_gain:
+            raise ValueError("abs(lti_init_input_gain) cannot exceed lti_max_input_gain")
+        if abs(self.lti_init_delta_gain) > self.lti_max_delta_gain:
+            raise ValueError("abs(lti_init_delta_gain) cannot exceed lti_max_delta_gain")
         if not (0.0 < self.act_threshold <= 1.0):
             raise ValueError("act_threshold must be in (0, 1]")
         if self.act_ponder_weight < 0.0:
@@ -103,7 +122,12 @@ def dense_lm_config_from_dict(data: dict[str, Any]) -> DenseLMConfig:
     """Reconstruct DenseLMConfig from checkpoint metadata."""
 
     allowed = DenseLMConfig.__dataclass_fields__.keys()
-    return DenseLMConfig(**{k: v for k, v in data.items() if k in allowed})
+    values = {k: v for k, v in data.items() if k in allowed}
+    if "use_ada_norm" not in values:
+        # Old checkpoints were trained with plain RMSNorm.  Preserve their
+        # module structure so they can still be loaded for diagnostics.
+        values["use_ada_norm"] = False
+    return DenseLMConfig(**values)
 
 
 @dataclass
@@ -121,7 +145,7 @@ class DenseRecurrentCore(nn.Module):
 
         base_t = norm(h_t + e + loop_embedding(t))
         delta_t = block(base_t) - base_t
-        h_{t+1} = A * h_t + B * e + delta_t
+        h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
 
     If ACT is enabled, the core also predicts a per-token halting probability
     after each recurrent update and returns the ACT-weighted hidden state.  The
@@ -140,7 +164,7 @@ class DenseRecurrentCore(nn.Module):
 
         self.cfg = cfg
         self.loop_dim = loop_dim
-        self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.norm = self._make_norm()
         self.block = DenseTransformerBlock(
             AttentionConfig(
                 dim=cfg.dim,
@@ -155,10 +179,24 @@ class DenseRecurrentCore(nn.Module):
                 dropout=cfg.dropout,
             ),
             norm_eps=cfg.norm_eps,
+            use_ada_norm=cfg.use_ada_norm,
+            ada_cond_dim=loop_dim,
         )
-        self.injection = LTIInjection(cfg.dim)
-        self.act_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.injection = LTIInjection(
+            cfg.dim,
+            init_log_dt=cfg.lti_init_log_dt,
+            init_input_gain=cfg.lti_init_input_gain,
+            init_delta_gain=cfg.lti_init_delta_gain,
+            max_input_gain=cfg.lti_max_input_gain,
+            max_delta_gain=cfg.lti_max_delta_gain,
+        )
+        self.act_norm = self._make_norm()
         self.act = ACTHalting(cfg.dim)
+
+    def _make_norm(self) -> nn.Module:
+        if self.cfg.use_ada_norm:
+            return AdaRMSNorm(self.cfg.dim, self.cfg.norm_eps, cond_dim=self.loop_dim)
+        return RMSNorm(self.cfg.dim, self.cfg.norm_eps)
 
     def forward(
         self,
@@ -182,14 +220,20 @@ class DenseRecurrentCore(nn.Module):
 
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
-            base = self.norm(h_loop + e)
-            delta = self.block.forward_delta(base, cache=None, layer_key="recurrent")
+            norm_cond = (h_loop - h)[..., : self.loop_dim]
+            base = self.norm(h_loop + e, norm_cond)
+            delta = self.block.forward_delta(
+                base,
+                cache=None,
+                layer_key="recurrent",
+                norm_cond=norm_cond,
+            )
             h = self.injection(h, e, delta)
             if collect_stats:
                 loop_rms.append(h.float().pow(2).mean().sqrt().detach())
 
             if accumulator is not None and loop_index >= act_start_loop:
-                halt_p = self.act(self.act_norm(h))
+                halt_p = self.act(self.act_norm(h, norm_cond))
                 act_out, act_weight = accumulator.step(
                     h,
                     halt_p,
@@ -217,13 +261,19 @@ class DenseRecurrentCore(nn.Module):
             stats = {}
             if collect_stats:
                 A = self.injection.A().detach()
-                B = self.injection.B().detach()
+                input_gain = self.injection.input_gain().detach()
+                delta_gain = self.injection.delta_gain().detach()
+                retention = 1.0 - A
                 stats.update(
                     {
                         "recurrent_loop_rms": torch.stack(loop_rms) if loop_rms else None,
                         "lti_A_min": A.min(),
                         "lti_A_max": A.max(),
-                        "lti_B_abs_max": B.abs().max(),
+                        "lti_B_abs_max": input_gain.abs().max(),
+                        "lti_input_gain_abs_max": input_gain.abs().max(),
+                        "lti_delta_gain_abs_max": delta_gain.abs().max(),
+                        "lti_effective_input_abs_max": (retention * input_gain).abs().max(),
+                        "lti_effective_delta_abs_max": (retention * delta_gain).abs().max(),
                     }
                 )
             if accumulator is not None:
@@ -277,6 +327,8 @@ class OpenMythosDenseLM(nn.Module):
                         dropout=cfg.dropout,
                     ),
                     norm_eps=cfg.norm_eps,
+                    use_ada_norm=cfg.use_ada_norm,
+                    ada_cond_dim=None,
                 )
                 for _ in range(cfg.prelude_layers)
             ]
@@ -300,12 +352,18 @@ class OpenMythosDenseLM(nn.Module):
                         dropout=cfg.dropout,
                     ),
                     norm_eps=cfg.norm_eps,
+                    use_ada_norm=cfg.use_ada_norm,
+                    ada_cond_dim=None,
                 )
                 for _ in range(cfg.coda_layers)
             ]
         )
 
-        self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.norm = (
+            AdaRMSNorm(cfg.dim, cfg.norm_eps, cond_dim=None)
+            if cfg.use_ada_norm
+            else RMSNorm(cfg.dim, cfg.norm_eps)
+        )
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
@@ -320,6 +378,28 @@ class OpenMythosDenseLM(nn.Module):
         if trainable_only:
             params = (p for p in params if p.requires_grad)
         return sum(p.numel() for p in params)
+
+    def parameter_breakdown(self) -> dict[str, int]:
+        def count(module: nn.Module) -> int:
+            return sum(p.numel() for p in module.parameters())
+
+        token_embedding = self.embed.weight.numel()
+        lm_head = 0 if self.cfg.tie_embeddings else count(self.lm_head)
+        prelude = count(self.prelude)
+        recurrent = count(self.recurrent)
+        coda = count(self.coda)
+        final_norm = count(self.norm)
+        body = prelude + recurrent + coda + final_norm
+        return {
+            "total": self.num_parameters(),
+            "body": body,
+            "token_embedding": token_embedding,
+            "lm_head": lm_head,
+            "prelude": prelude,
+            "recurrent": recurrent,
+            "coda": coda,
+            "final_norm": final_norm,
+        }
 
     def forward(
         self,
