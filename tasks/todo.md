@@ -60,3 +60,46 @@
 - ACT is mathematically valid as an expected-depth halting mechanism, but it is still an ablation feature rather than a guaranteed win.
 - The LTI linear part is stable by construction (`A` in `(0, 1)`), while the nonlinear transformer delta still needs RMS/gradient monitoring during training.
 - The prototype is a complete causal LM generator, but it is not yet a production inference model because KV-cache and optimized per-token ACT scheduling remain excluded.
+
+# Training Logging Fix
+
+- [x] Make training/eval/generation prints line-buffered and flushed so `tee` receives logs every `--log-every` step.
+
+# Long-Run Scheduler And ACT Usability
+
+- [x] Replace the zero-ending HF cosine scheduler with a local scheduler that honors `--min-lr-ratio`.
+- [x] Add `--decay-steps` so long runs can decay to a floor and then continue training at that floor.
+- [x] Add `--lr-schedule` with `cosine`, `linear`, and `constant` modes.
+- [x] Sync optimizer LR to the new scheduler after resume so old zero-LR checkpoints can continue.
+- [x] Add `act_min_steps` / `--act-min-steps` to stop ACT from collapsing useful recurrent depth too early.
+
+# No-ACT Accuracy Audit
+
+- [x] Re-check data formatting, label construction, and packing.
+- [x] Fix supervised objective so the default loss trains the response, not prompt copying.
+- [x] Stop treating truncated long reasoning traces as complete EOS-terminated solutions.
+- [x] Improve startup/log metrics that affect run comparability.
+- [x] Record remaining architecture/training limitations for the next prototype pass.
+
+## No-ACT Accuracy Audit Review
+
+- Added `tasks/no_act_accuracy_audit.md` with fixed issues, remaining accuracy limits, and next checks.
+- Default training objective now targets response tokens instead of prompt copying.
+- Long examples are dropped by default rather than converted into false completed solutions.
+- Packing keeps examples intact when they fit in the configured context.
+- Loss and perplexity are now weighted by supervised tokens, which matters after prompt masking.
+
+# Exact Answer Evaluation And 1024-Dim Baseline
+
+- [x] Raise the dense prototype default width to `dim=1024`.
+- [x] Add dataset-driven exact-answer generation evaluation with the same prompt format as training.
+- [x] Add answer extraction and normalization for OpenR1-style final answers.
+- [x] Add eval logging/prediction output for debugging wrong answers.
+- [x] Verify syntax locally without importing torch runtime.
+
+## Exact Eval Review
+
+- Added `exact-eval` subcommand to `training/train_dense_openr1.py`.
+- Exact eval prompts with `Problem:\n{problem}\n\nSolution:\n`, matching the supervised generation prefix and excluding the target answer.
+- The evaluator extracts `\boxed{...}`, `Final answer:`, `####`, or the final non-empty line, then compares normalized exact answers.
+- Predictions can be written to JSONL with generated text, target, prediction, normalized forms, and prompt token count.

@@ -70,3 +70,14 @@ def test_forward_with_act_stats():
     assert "act_ponder_loss" in out.stats
     assert "act_loss" in out.stats
     assert out.stats["act_expected_steps"].item() >= 1.0
+
+
+def test_act_min_steps_delays_weighted_output():
+    cfg = tiny_config()
+    cfg.use_act = True
+    cfg.act_min_steps = 2
+    model = OpenMythosDenseLM(cfg)
+    input_ids = torch.randint(3, cfg.vocab_size, (2, 16))
+    out = model(input_ids, labels=input_ids.clone(), collect_stats=True)
+    assert out.stats is not None
+    assert out.stats["act_expected_steps"].item() >= 2.0

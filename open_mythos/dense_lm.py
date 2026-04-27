@@ -42,7 +42,7 @@ class DenseLMConfig:
     """
 
     vocab_size: int
-    dim: int = 512
+    dim: int = 1024
     n_heads: int = 8
     n_kv_heads: Optional[int] = None
     prelude_layers: int = 1
@@ -59,6 +59,7 @@ class DenseLMConfig:
     use_act: bool = False
     act_threshold: float = 0.99
     act_ponder_weight: float = 0.01
+    act_min_steps: int = 1
     pad_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
     bos_token_id: Optional[int] = None
@@ -92,6 +93,10 @@ class DenseLMConfig:
             raise ValueError("act_threshold must be in (0, 1]")
         if self.act_ponder_weight < 0.0:
             raise ValueError("act_ponder_weight must be non-negative")
+        if self.act_min_steps <= 0:
+            raise ValueError("act_min_steps must be positive")
+        if self.act_min_steps > self.max_loop_iters:
+            raise ValueError("act_min_steps cannot exceed max_loop_iters")
 
 
 def dense_lm_config_from_dict(data: dict[str, Any]) -> DenseLMConfig:
@@ -173,6 +178,7 @@ class DenseRecurrentCore(nn.Module):
         act_p_means: list[torch.Tensor] = []
         accumulator = ACTAccumulator(self.cfg.act_threshold) if self.cfg.use_act else None
         expected_steps: Optional[torch.Tensor] = None
+        act_start_loop = min(self.cfg.act_min_steps, loops) - 1
 
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
@@ -182,7 +188,7 @@ class DenseRecurrentCore(nn.Module):
             if collect_stats:
                 loop_rms.append(h.float().pow(2).mean().sqrt().detach())
 
-            if accumulator is not None:
+            if accumulator is not None and loop_index >= act_start_loop:
                 halt_p = self.act(self.act_norm(h))
                 act_out, act_weight = accumulator.step(
                     h,
