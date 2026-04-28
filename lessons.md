@@ -21,3 +21,9 @@
 ## Monitor Training With Structured Events
 
 - For long Spark runs, write JSONL metric events directly from train/eval/exact-eval instead of relying on raw log scraping. Include body parameter counts, LTI gains, loop RMS, generation EOS/hit-max/repetition stats, and exact-match summaries so the Web UI can diagnose quality without reading `tee` logs manually.
+- Train-window metrics must be averaged over the same window and weighting. Do not display one microbatch's `lm_loss` next to a multi-step averaged objective loss; it looks like instability even when validation and averaged loss are smooth.
+- Epoch metrics must name their indexing convention explicitly. Use zero-based `epoch_index/current_epoch` for code-like progress and one-based `epoch_number` only for human display.
+
+## Dynamic Padding For Causal SFT
+
+- For right-padded causal LM batches, pad keys are future positions for real tokens, so real-token outputs stay correct without a separate padding attention mask. Always force pad labels to `-100`, log padding efficiency, and keep a `--static-padding` escape hatch for debugging fixed-shape behavior.

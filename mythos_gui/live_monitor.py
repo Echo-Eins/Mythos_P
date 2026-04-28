@@ -150,6 +150,8 @@ def training_dashboard(df: pd.DataFrame) -> go.Figure:
     _add_trace(fig, df, x_col="step", y_col="eval_ppl", name="eval ppl", row=1, col=2)
     _add_trace(fig, df, x_col="step", y_col="lr", name="lr", row=2, col=1)
     _add_trace(fig, df, x_col="step", y_col="tok_s", name="tokens/s", row=2, col=2)
+    _add_trace(fig, df, x_col="step", y_col="input_tok_s", name="input tok/s", row=2, col=2)
+    _add_trace(fig, df, x_col="step", y_col="padded_tok_s", name="padded tok/s", row=2, col=2)
     _add_trace(fig, df, x_col="step", y_col="epochs_seen", name="epochs seen", row=2, col=2)
     _add_trace(fig, df, x_col="step", y_col="grad_norm", name="grad norm", row=3, col=1)
     _add_trace(fig, df, x_col="step", y_col="cuda_mem_gb", name="CUDA GB", row=3, col=1)
@@ -251,6 +253,17 @@ def summary_markdown(df: pd.DataFrame) -> str:
             f"updates/epoch={latest.get('updates_per_epoch')}, "
             f"batches/epoch={latest.get('train_batches_per_epoch')}"
         )
+        data_stats = latest.get("data")
+        if isinstance(data_stats, dict):
+            train_lengths = data_stats.get("train_length_stats")
+            if isinstance(train_lengths, dict):
+                lines.append(
+                    "Padding plan: "
+                    f"dynamic={data_stats.get('dynamic_padding')}, "
+                    f"pad_multiple={data_stats.get('pad_to_multiple')}, "
+                    f"mean_len={train_lengths.get('mean_input_len')}, "
+                    f"static_eff={train_lengths.get('static_padding_efficiency')}"
+                )
     train = df[df["event"] == "train"] if "event" in df.columns else pd.DataFrame()
     if not train.empty:
         latest = train.iloc[-1]
@@ -258,6 +271,8 @@ def summary_markdown(df: pd.DataFrame) -> str:
             "Latest train: "
             f"step={latest.get('step')}, loss={latest.get('loss')}, "
             f"lr={latest.get('lr')}, tok/s={latest.get('tok_s')}, "
+            f"pad_eff={latest.get('padding_efficiency')}, "
+            f"epoch_index={latest.get('epoch_index')}, "
             f"epochs={latest.get('epochs_seen')}/{latest.get('target_epochs')}"
         )
     eval_rows = df[df["event"] == "eval"] if "event" in df.columns else pd.DataFrame()

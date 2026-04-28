@@ -139,6 +139,8 @@
 - [x] Review CERBER `app.py`, `live_monitor.py`, and `inference_diagnostics.py` for reusable monitoring patterns.
 - [x] Add structured train/eval/exact-eval JSONL metric events.
 - [x] Add explicit epoch accounting and optional `--max-epochs` train target.
+- [x] Fix train `lm_loss` logging so it reports the same log-window average as objective loss instead of one noisy microbatch.
+- [x] Make epoch numbering explicit: zero-based `epoch_index/current_epoch` plus one-based `epoch_number`.
 - [x] Add Mythos-specific Gradio/Plotly Web UI for metrics, recurrent diagnostics, generation diagnostics, and attention/label masks.
 - [x] Replace the active LTI update with bounded EMA-style input and delta injection.
 - [x] Add loop-conditioned AdaRMSNorm support without adding unused full-dim Ada projections to ordinary blocks.
@@ -152,3 +154,21 @@
 - Training logs `epochs_seen`, `target_epochs`, `current_epoch`, `epoch_progress`, and emits `epoch_end` events when the shuffled train loader is exhausted.
 - LTI now logs raw/effective input and delta gains so instability can be diagnosed from graphs instead of raw logs.
 - The recommended no-ACT command now uses `dim=1536`, `n_heads=24`, `prelude_layers=2`, `coda_layers=1`, and `ffn_hidden_dim=4352`, giving roughly 120M non-embedding body parameters.
+
+# Dynamic Padding Pass
+
+- [x] Convert non-packed supervised samples from static 1024-token padding to variable-length stored chunks.
+- [x] Add an optimized collator that pads each batch to its local maximum length, optionally aligned to a small multiple.
+- [x] Add stochastic length-grouped training batches to improve padding efficiency without fully sorting the epoch.
+- [x] Preserve correctness for labels, response-only masking, pad masking, and optional sample packing.
+- [x] Update defaults/recommended command to `batch-size=4`, `grad-accum=4`, no compile, no curriculum.
+- [x] Add local syntax verification and document the expected speedup mechanism.
+
+## Dynamic Padding Review
+
+- Non-packed OpenR1 samples are now stored at their real token length; packed chunks are also left unpadded until collate time.
+- `CausalBatchCollator` right-pads each batch to the local maximum sequence length aligned by `--pad-to-multiple`, capped at `--max-seq-len`.
+- Training uses shuffled length buckets by default; disable with `--no-length-bucketing` if a fully random batch mix is needed.
+- Pad tokens remain future positions for real tokens under causal attention, and all pad labels are forced to `-100`.
+- Train logs now include padding efficiency plus real/padded sequence length and throughput metrics so the speedup is visible in the Web UI.
+- Syntax verification passed with `py -3 -m py_compile` for the train script, UI monitor, and dynamic padding tests.

@@ -55,6 +55,8 @@ python training/train_dense_openr1.py train \
   --loss-on response \
   --long-sample-policy drop \
   --min-response-tokens 16 \
+  --pad-to-multiple 8 \
+  --length-bucket-mult 64 \
   --dim 1536 \
   --n-heads 24 \
   --prelude-layers 2 \
@@ -66,8 +68,8 @@ python training/train_dense_openr1.py train \
   --lti-init-log-dt -2.0 \
   --lti-init-input-gain 1.0 \
   --lti-init-delta-gain 0.35 \
-  --batch-size 1 \
-  --grad-accum 16 \
+  --batch-size 4 \
+  --grad-accum 4 \
   --max-epochs 1.0 \
   --eval-every 500 \
   --save-every 1000 \

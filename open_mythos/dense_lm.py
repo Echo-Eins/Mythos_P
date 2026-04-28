@@ -434,7 +434,9 @@ class OpenMythosDenseLM(nn.Module):
         logits = self.lm_head(self.norm(x))
 
         loss = None
-        stats = dict(recurrent_stats) if recurrent_stats is not None else None
+        stats: Optional[dict[str, Any]] = (
+            dict(recurrent_stats) if recurrent_stats is not None else {}
+        )
         if labels is not None:
             if labels.shape != input_ids.shape:
                 raise ValueError("labels must have the same shape as input_ids")
@@ -444,8 +446,7 @@ class OpenMythosDenseLM(nn.Module):
                 ignore_index=-100,
             )
             loss = lm_loss
-            if stats is not None:
-                stats["lm_loss"] = lm_loss.detach()
+            stats["lm_loss"] = lm_loss.detach()
             if self.cfg.use_act and self.cfg.act_ponder_weight > 0.0:
                 if stats is None or "act_ponder_loss" not in stats:
                     raise RuntimeError("ACT is enabled but recurrent core returned no ponder loss")
@@ -454,6 +455,8 @@ class OpenMythosDenseLM(nn.Module):
                 loss = loss + act_loss
                 stats["act_loss"] = act_loss.detach()
 
+        if stats == {}:
+            stats = None
         if stats is not None:
             for key, value in list(stats.items()):
                 if torch.is_tensor(value) and key not in {"act_ponder_loss"}:
