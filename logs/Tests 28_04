@@ -1,0 +1,260 @@
+.venv) echoens@gx10-4fa2:~/Coding/Python/Mythos_P$ CKPT=runs/dense_openr1_no_act_1536_body117_dynpad_b4_lti_fix/final.pt
+
+for L in 1 2 4 6 8; do
+  echo "===== n_loops=$L ====="
+  python training/train_dense_openr1.py eval \
+    --checkpoint "$CKPT" \
+    --dataset-path data/openr1_math_220k/hf_default_train \
+    --tokenizer Qwen/Qwen2.5-1.5B \
+    --max-seq-len 1024 \
+    --loss-on response \
+    --long-sample-policy drop \
+    --min-response-tokens 16 \
+    --batch-size 4 \
+    --max-batches 100 \
+    --n-loops "$L" \
+    --dtype bf16 \
+done 2>&1 | tee logs/loop_sweep_current.log
+===== n_loops=1 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{
+  "loss": 1.7163327750879294,
+  "lm_loss": 1.7163327750879294,
+  "ppl": 5.5640862483812095,
+  "tokens": 117417,
+  "lti_A_min": 0.39820295572280884,
+  "lti_A_max": 0.42974853515625,
+  "lti_tau_min": 1.0860198736190796,
+  "lti_tau_max": 1.1840554475784302,
+  "lti_B_abs_max": 0.29296875,
+  "lti_input_gain_abs_max": 0.29296875,
+  "lti_delta_gain_abs_max": 0.369140625,
+  "lti_effective_input_abs_max": 0.16768918931484222,
+  "lti_effective_delta_abs_max": 0.21686407923698425
+}
+===== n_loops=2 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{
+  "loss": 1.4947593954961047,
+  "lm_loss": 1.4947593954961047,
+  "ppl": 4.458263745455146,
+  "tokens": 117417,
+  "lti_A_min": 0.39820295572280884,
+  "lti_A_max": 0.42974853515625,
+  "lti_tau_min": 1.0860198736190796,
+  "lti_tau_max": 1.1840554475784302,
+  "lti_B_abs_max": 0.29296875,
+  "lti_input_gain_abs_max": 0.29296875,
+  "lti_delta_gain_abs_max": 0.369140625,
+  "lti_effective_input_abs_max": 0.16768918931484222,
+  "lti_effective_delta_abs_max": 0.21686407923698425
+}
+===== n_loops=4 =====
+{
+  "loss": 1.38953754757556,
+  "lm_loss": 1.38953754757556,
+  "ppl": 4.012993805099683,
+  "tokens": 117417,
+  "lti_A_min": 0.39820295572280884,
+  "lti_A_max": 0.42974853515625,
+  "lti_tau_min": 1.0860198736190796,
+  "lti_tau_max": 1.1840554475784302,
+  "lti_B_abs_max": 0.29296875,
+  "lti_input_gain_abs_max": 0.29296875,
+  "lti_delta_gain_abs_max": 0.369140625,
+  "lti_effective_input_abs_max": 0.16768918931484222,
+  "lti_effective_delta_abs_max": 0.21686407923698425
+}
+===== n_loops=6 =====
+{
+  "loss": 1.4074763068327056,
+  "lm_loss": 1.4074763068327056,
+  "ppl": 4.085631502064291,
+  "tokens": 117417,
+  "lti_A_min": 0.39820295572280884,
+  "lti_A_max": 0.42974853515625,
+  "lti_tau_min": 1.0860198736190796,
+  "lti_tau_max": 1.1840554475784302,
+  "lti_B_abs_max": 0.29296875,
+  "lti_input_gain_abs_max": 0.29296875,
+  "lti_delta_gain_abs_max": 0.369140625,
+  "lti_effective_input_abs_max": 0.16768918931484222,
+  "lti_effective_delta_abs_max": 0.21686407923698425
+}
+===== n_loops=8 =====
+{
+  "loss": 1.4216316719235162,
+  "lm_loss": 1.4216316719235162,
+  "ppl": 4.143876373752572,
+  "tokens": 117417,
+  "lti_A_min": 0.39820295572280884,
+  "lti_A_max": 0.42974853515625,
+  "lti_tau_min": 1.0860198736190796,
+  "lti_tau_max": 1.1840554475784302,
+  "lti_B_abs_max": 0.29296875,
+  "lti_input_gain_abs_max": 0.29296875,
+  "lti_delta_gain_abs_max": 0.369140625,
+  "lti_effective_input_abs_max": 0.16768918931484222,
+  "lti_effective_delta_abs_max": 0.21686407923698425
+}
+(.venv) echoens@gx10-4fa2:~/Coding/Python/Mythos_P$ mkdir -p evals/loop_sweep_current
+
+for L in 1 2 4 6 8; do
+  echo "===== exact n_loops=$L ====="
+  python training/train_dense_openr1.py exact-eval \
+    --checkpoint "$CKPT" \
+    --dataset-path data/openr1_math_220k/hf_default_train \
+    --tokenizer Qwen/Qwen2.5-1.5B \
+    --max-seq-len 1024 \
+    --loss-on response \
+    --long-sample-policy drop \
+    --min-response-tokens 16 \
+    --max-samples 100 \
+    --max-new-tokens 512 \
+    --n-loops "$L" \
+    --temperature 1.0 \
+done 2>&1 | tee logs/exact_loop_sweep_current.logrics.jsonl" \{L}.jsonl" \
+===== exact n_loops=1 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Traceback (most recent call last):
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1789, in <module>
+    main()
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1781, in main
+    exact_eval_cmd(args)
+  File "/home/echoens/Coding/Python/CERBER/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1597, in exact_eval_cmd
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 202, in encode
+    chunks = list(chunks)
+             ^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "/usr/lib/python3.12/json/encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "/usr/lib/python3.12/json/encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type PosixPath is not JSON serializable
+===== exact n_loops=2 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Traceback (most recent call last):
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1789, in <module>
+    main()
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1781, in main
+    exact_eval_cmd(args)
+  File "/home/echoens/Coding/Python/CERBER/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1597, in exact_eval_cmd
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 202, in encode
+    chunks = list(chunks)
+             ^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "/usr/lib/python3.12/json/encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "/usr/lib/python3.12/json/encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type PosixPath is not JSON serializable
+===== exact n_loops=4 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Traceback (most recent call last):
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1789, in <module>
+    main()
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1781, in main
+    exact_eval_cmd(args)
+  File "/home/echoens/Coding/Python/CERBER/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1597, in exact_eval_cmd
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 202, in encode
+    chunks = list(chunks)
+             ^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "/usr/lib/python3.12/json/encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "/usr/lib/python3.12/json/encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type PosixPath is not JSON serializable
+===== exact n_loops=6 =====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Traceback (most recent call last):
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1789, in <module>
+    main()
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1781, in main
+    exact_eval_cmd(args)
+  File "/home/echoens/Coding/Python/CERBER/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1597, in exact_eval_cmd
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 202, in encode
+    chunks = list(chunks)
+             ^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "/usr/lib/python3.12/json/encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "/usr/lib/python3.12/json/encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type PosixPath is not JSON serializable
+===== exact n_loops=8 =====
+Traceback (most recent call last):
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1789, in <module>
+    main()
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1781, in main
+    exact_eval_cmd(args)
+  File "/home/echoens/Coding/Python/CERBER/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/echoens/Coding/Python/Mythos_P/training/train_dense_openr1.py", line 1597, in exact_eval_cmd
+    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 202, in encode
+    chunks = list(chunks)
+             ^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 432, in _iterencode
+    yield from _iterencode_dict(o, _current_indent_level)
+  File "/usr/lib/python3.12/json/encoder.py", line 406, in _iterencode_dict
+    yield from chunks
+  File "/usr/lib/python3.12/json/encoder.py", line 439, in _iterencode
+    o = _default(o)
+        ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type PosixPath is not JSON serializable
