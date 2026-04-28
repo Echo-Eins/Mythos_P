@@ -13,6 +13,9 @@ Embedding -> prelude dense blocks -> recurrent dense block with LTI injection ->
 - Startup logs now include data filtering stats, loss target, long-sample policy, seed, sequence length, effective batch chunks, and scheduler settings.
 - LTI injection now uses the stable EMA-style update `A*h + (1-A)*(B_e*e + B_delta*delta)` instead of an unconstrained `A*h + B*e + delta`.
 - Recurrent-depth norms can use loop-conditioned AdaRMSNorm; train/eval emit structured `metrics.jsonl` events for the Web UI.
+- LTI initialization is now matched to a 4-loop budget: `init_log_dt=-0.5`, `init_input_gain=0.3`, `init_delta_gain=0.35`.
+- The recurrent block no longer adds `e` inside the transformer base; direct persistent input injection is handled by LTI.
+- AdaRMSNorm loop conditioning now receives state-dependent `h_loop[..., :loop_dim]`.
 
 ## Highest-Impact Remaining Limits
 
@@ -65,8 +68,8 @@ python training/train_dense_openr1.py train \
   --max-loop-iters 4 \
   --train-loops 4 \
   --ada-norm \
-  --lti-init-log-dt -2.0 \
-  --lti-init-input-gain 1.0 \
+  --lti-init-log-dt -0.5 \
+  --lti-init-input-gain 0.3 \
   --lti-init-delta-gain 0.35 \
   --batch-size 4 \
   --grad-accum 4 \
@@ -84,16 +87,16 @@ python training/train_dense_openr1.py train \
   --device cuda \
   --num-workers 2 \
   --log-every 10 \
-  --out-dir runs/dense_openr1_no_act_1536_body117 \
-  --metrics-jsonl runs/dense_openr1_no_act_1536_body117/metrics.jsonl \
-  2>&1 | tee logs/train_no_act_1536_body117.log
+  --out-dir runs/dense_openr1_no_act_1536_body117_dynpad_lti \
+  --metrics-jsonl runs/dense_openr1_no_act_1536_body117_dynpad_lti/metrics.jsonl \
+  2>&1 | tee logs/train_no_act_1536_body117_dynpad_lti.log
 ```
 
 ## Suggested Exact-Answer Eval
 
 ```bash
 python training/train_dense_openr1.py exact-eval \
-  --checkpoint runs/dense_openr1_no_act_1536_body117/final.pt \
+  --checkpoint runs/dense_openr1_no_act_1536_body117_dynpad_lti/final.pt \
   --dataset-path data/openr1_math_220k/hf_default_train \
   --tokenizer Qwen/Qwen2.5-1.5B \
   --max-samples 100 \
@@ -102,8 +105,8 @@ python training/train_dense_openr1.py exact-eval \
   --n-loops 4 \
   --device cuda \
   --dtype bf16 \
-  --predictions-path runs/dense_openr1_no_act_1536_body117/exact_eval_100.jsonl \
-  --metrics-jsonl runs/dense_openr1_no_act_1536_body117/metrics.jsonl \
+  --predictions-path runs/dense_openr1_no_act_1536_body117_dynpad_lti/exact_eval_100.jsonl \
+  --metrics-jsonl runs/dense_openr1_no_act_1536_body117_dynpad_lti/metrics.jsonl \
   2>&1 | tee logs/exact_eval_no_act_1536_100.log
 ```
 
@@ -114,4 +117,4 @@ python mythos_gui/app.py
 ```
 
 Then open `http://localhost:7860` and point the Live Metrics tab at
-`runs/dense_openr1_no_act_1536_body117/metrics.jsonl`.
+`runs/dense_openr1_no_act_1536_body117_dynpad_lti/metrics.jsonl`.

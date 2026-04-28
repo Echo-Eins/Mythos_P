@@ -195,8 +195,8 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rope-theta", type=float, default=500_000.0)
     parser.add_argument("--ada-norm", dest="use_ada_norm", action="store_true", default=True)
     parser.add_argument("--no-ada-norm", dest="use_ada_norm", action="store_false")
-    parser.add_argument("--lti-init-log-dt", type=float, default=-2.0)
-    parser.add_argument("--lti-init-input-gain", type=float, default=1.0)
+    parser.add_argument("--lti-init-log-dt", type=float, default=-0.5)
+    parser.add_argument("--lti-init-input-gain", type=float, default=0.3)
     parser.add_argument("--lti-init-delta-gain", type=float, default=0.35)
     parser.add_argument("--lti-max-input-gain", type=float, default=1.0)
     parser.add_argument("--lti-max-delta-gain", type=float, default=1.0)
@@ -1157,6 +1157,8 @@ def evaluate(
         for key in (
             "lti_A_min",
             "lti_A_max",
+            "lti_tau_min",
+            "lti_tau_max",
             "lti_B_abs_max",
             "lti_input_gain_abs_max",
             "lti_delta_gain_abs_max",
@@ -1166,6 +1168,7 @@ def evaluate(
             "act_ponder_loss",
             "act_expected_steps",
             "act_hard_steps",
+            "act_remainder",
             "act_halt_fraction",
             "act_halting_p_mean",
         ):
@@ -1416,6 +1419,8 @@ def train(args: argparse.Namespace) -> None:
                 for key in (
                     "lti_A_min",
                     "lti_A_max",
+                    "lti_tau_min",
+                    "lti_tau_max",
                     "lti_B_abs_max",
                     "lti_input_gain_abs_max",
                     "lti_delta_gain_abs_max",
@@ -1424,6 +1429,7 @@ def train(args: argparse.Namespace) -> None:
                     "act_ponder_loss",
                     "act_expected_steps",
                     "act_hard_steps",
+                    "act_remainder",
                     "act_halt_fraction",
                     "act_halting_p_mean",
                 ):

@@ -56,6 +56,8 @@ def _tail_table(df: pd.DataFrame, limit: int = 200) -> pd.DataFrame:
             "target_epochs",
             "lti_A_min",
             "lti_A_max",
+            "lti_tau_min",
+            "lti_tau_max",
             "lti_effective_input_abs_max",
             "lti_effective_delta_abs_max",
             "act_expected_steps",

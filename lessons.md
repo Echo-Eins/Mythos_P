@@ -27,3 +27,11 @@
 ## Dynamic Padding For Causal SFT
 
 - For right-padded causal LM batches, pad keys are future positions for real tokens, so real-token outputs stay correct without a separate padding attention mask. Always force pad labels to `-100`, log padding efficiency, and keep a `--static-padding` escape hatch for debugging fixed-shape behavior.
+
+## Recurrent LTI Defaults Must Match Loop Budget
+
+- For a fixed small recurrent budget such as 4 loops, LTI retention near `A=0.87` makes the delta path too weak at initialization. Check `1-A`, effective input/delta gains, and implied time constant against the actual loop count before treating recurrence as active.
+
+## Avoid Fake Adaptive Conditioning
+
+- AdaNorm conditioning should carry useful state or be removed. A constant loop-index-only condition is mostly a per-loop bias path and can hide that the recurrent state is not being used by the adaptive layer.

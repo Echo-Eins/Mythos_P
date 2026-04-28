@@ -174,10 +174,12 @@ def recurrent_dashboard(df: pd.DataFrame) -> go.Figure:
     fig = make_subplots(
         rows=2,
         cols=2,
-        subplot_titles=("LTI A", "LTI gains", "Effective LTI gains", "Loop RMS"),
+        subplot_titles=("LTI A / tau", "LTI gains", "Effective LTI gains", "Loop RMS"),
     )
     _add_trace(fig, df, x_col="step", y_col="lti_A_min", name="A min", row=1, col=1)
     _add_trace(fig, df, x_col="step", y_col="lti_A_max", name="A max", row=1, col=1)
+    _add_trace(fig, df, x_col="step", y_col="lti_tau_min", name="tau min", row=1, col=1)
+    _add_trace(fig, df, x_col="step", y_col="lti_tau_max", name="tau max", row=1, col=1)
     _add_trace(fig, df, x_col="step", y_col="lti_input_gain_abs_max", name="input", row=1, col=2)
     _add_trace(fig, df, x_col="step", y_col="lti_delta_gain_abs_max", name="delta", row=1, col=2)
     _add_trace(fig, df, x_col="step", y_col="lti_effective_input_abs_max", name="input eff", row=2, col=1)

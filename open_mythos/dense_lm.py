@@ -56,8 +56,8 @@ class DenseLMConfig:
     rope_theta: float = 500_000.0
     norm_eps: float = 1e-6
     use_ada_norm: bool = True
-    lti_init_log_dt: float = -2.0
-    lti_init_input_gain: float = 1.0
+    lti_init_log_dt: float = -0.5
+    lti_init_input_gain: float = 0.3
     lti_init_delta_gain: float = 0.35
     lti_max_input_gain: float = 1.0
     lti_max_delta_gain: float = 1.0
@@ -143,7 +143,7 @@ class DenseRecurrentCore(nn.Module):
 
     Loop equation:
 
-        base_t = norm(h_t + e + loop_embedding(t))
+        base_t = norm(h_t + loop_embedding(t))
         delta_t = block(base_t) - base_t
         h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
 
@@ -220,12 +220,12 @@ class DenseRecurrentCore(nn.Module):
 
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
-            norm_cond = (h_loop - h)[..., : self.loop_dim]
-            base = self.norm(h_loop + e, norm_cond)
+            norm_cond = h_loop[..., : self.loop_dim]
+            base = self.norm(h_loop, norm_cond)
             delta = self.block.forward_delta(
                 base,
                 cache=None,
-                layer_key="recurrent",
+                layer_key=f"recurrent.loop_{loop_index}",
                 norm_cond=norm_cond,
             )
             h = self.injection(h, e, delta)
@@ -269,6 +269,8 @@ class DenseRecurrentCore(nn.Module):
                         "recurrent_loop_rms": torch.stack(loop_rms) if loop_rms else None,
                         "lti_A_min": A.min(),
                         "lti_A_max": A.max(),
+                        "lti_tau_min": (-1.0 / A.log()).min(),
+                        "lti_tau_max": (-1.0 / A.log()).max(),
                         "lti_B_abs_max": input_gain.abs().max(),
                         "lti_input_gain_abs_max": input_gain.abs().max(),
                         "lti_delta_gain_abs_max": delta_gain.abs().max(),
@@ -280,12 +282,16 @@ class DenseRecurrentCore(nn.Module):
                 assert expected_steps is not None
                 assert accumulator.steps is not None
                 assert accumulator.halted is not None
+                assert accumulator.remainder is not None
+                hard_steps = accumulator.steps.float().mean()
+                remainder = accumulator.remainder.mean()
                 stats.update(
                     {
                         "act_expected_steps": expected_steps.mean(),
-                        "act_hard_steps": accumulator.steps.float().mean().detach(),
+                        "act_hard_steps": hard_steps,
                         "act_halt_fraction": accumulator.halted.float().mean().detach(),
-                        "act_ponder_loss": expected_steps.mean(),
+                        "act_remainder": remainder,
+                        "act_ponder_loss": hard_steps + remainder,
                     }
                 )
                 if collect_stats and act_p_means:

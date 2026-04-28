@@ -172,3 +172,24 @@
 - Pad tokens remain future positions for real tokens under causal attention, and all pad labels are forced to `-100`.
 - Train logs now include padding efficiency plus real/padded sequence length and throughput metrics so the speedup is visible in the Web UI.
 - Syntax verification passed with `py -3 -m py_compile` for the train script, UI monitor, and dynamic padding tests.
+
+# Recurrent LTI Audit Fixes
+
+- [x] Make active LTI defaults less inert for a 4-loop recurrent core.
+- [x] Remove double direct input dominance inside the recurrent block path.
+- [x] Make AdaRMSNorm loop conditioning state-dependent instead of pure loop-index constant.
+- [x] Use per-loop recurrent layer keys for future cache correctness.
+- [x] Align loop-index embedding layout with the legacy `main.py` convention.
+- [x] Fix reference MoE top-1 router gradient and use explicit `index_add_` accumulation.
+- [x] Add ACT remainder to ponder diagnostics/loss.
+- [x] Verify syntax and update the recommended train command.
+
+## Recurrent LTI Audit Review
+
+- LTI defaults are now `init_log_dt=-0.5`, `init_input_gain=0.3`, `init_delta_gain=0.35`, so the initial effective delta path is roughly 0.16 instead of 0.04.
+- The recurrent block now transforms `h + loop_embedding` and uses the direct LTI path for persistent input injection, avoiding `h + e` plus direct `e` dominance.
+- AdaRMSNorm conditioning inside the recurrent core now receives `h_loop[..., :loop_dim]`, not the constant loop embedding difference.
+- Recurrent layer keys include `loop_{i}` for future KV-cache correctness.
+- Reference MoE top-1 routing keeps gate probability gradients, and routed accumulation uses `index_add_`.
+- ACT logs `act_remainder` and uses `hard_steps + remainder` for the ponder objective.
+- Syntax verification passed with `py -3 -m py_compile` for model, training, and tests.
