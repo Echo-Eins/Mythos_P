@@ -285,3 +285,41 @@ Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF
 {"step": 1290, "loss": 1.455542760901153, "lm_loss": 1.45554275661842, "lr": 2.003670264546297e-05, "grad_norm": 0.5392602682113647, "tok_s": 4335.816568235008, "input_tok_s": 5454.099520355268, "padded_tok_s": 5625.821768407827, "padding_efficiency": 0.9694760596546311, "padded_seq_len_mean": 477.75, "real_seq_len_mean": 463.1671875, "micro_batches_seen": 20640, "chunks_seen": 82560, "epochs_seen": 0.9924031156842004, "epoch_index": 0, "epoch_number": 1, "current_epoch": 0, "epoch_progress": 0.9924031156842004, "target_epochs": 1.000096163092605, "updates_per_epoch": 1299.875, "cuda_mem_gb": 19.010182144, "lti_A_min": 0.6645234227180481, "lti_A_max": 0.6730332374572754, "lti_tau_min": 2.446871519088745, "lti_tau_max": 2.5255041122436523, "lti_B_abs_max": 0.3061385154724121, "lti_input_gain_abs_max": 0.3061385154724121, "lti_delta_gain_abs_max": 0.3701505959033966, "lti_effective_input_abs_max": 0.10063829272985458, "lti_effective_delta_abs_max": 0.1239103376865387, "recurrent_input_mixer_h_gate_mean": 0.7005897760391235, "recurrent_output_bridge_h_gate_mean": 0.7502797842025757, "recurrent_coda_input_rms": 1.1489146947860718, "loop_rms": [1.621056, 1.533036, 1.499479, 1.471314], "mixed_rms": [2.184462, 1.996478, 1.895035, 1.828125], "delta_rms": [4.510129, 4.267591, 3.986707, 3.710402], "drive_rms": [1.779332, 1.693104, 1.594206, 1.498839], "h_e_cosine": [1.0, 0.948169, 0.847992, 0.75664], "h_delta_cosine": [0.15294, 0.42623, 0.600539, 0.703424]}
 {"event": "epoch_end", "step": 1300, "completed_epochs": 1, "micro_batches_seen": 20798, "chunks_seen": 83192, "epochs_seen": 1.0, "epoch_index": 1, "epoch_number": 2, "current_epoch": 1, "epoch_progress": 0.0, "target_epochs": 1.000096163092605, "updates_per_epoch": 1299.875}
 {"step": 1300, "loss": 1.39548483164981, "lm_loss": 1.3954848293192585, "lr": 2e-05, "grad_norm": 0.5837920904159546, "tok_s": 4105.681906185993, "input_tok_s": 5331.433230368738, "padded_tok_s": 5509.852478887384, "padding_efficiency": 0.9676181441876509, "padded_seq_len_mean": 434.85, "real_seq_len_mean": 420.76875, "micro_batches_seen": 20800, "chunks_seen": 83200, "epochs_seen": 1.000096163092605, "epoch_index": 1, "epoch_number": 2, "current_epoch": 1, "epoch_progress": 9.616309260507272e-05, "target_epochs": 1.000096163092605, "updates_per_epoch": 1299.875, "cuda_mem_gb": 19.010182144, "lti_A_min": 0.66447514295578, "lti_A_max": 0.6729847192764282, "lti_tau_min": 2.4464364051818848, "lti_tau_max": 2.5250442028045654, "lti_B_abs_max": 0.30613499879837036, "lti_input_gain_abs_max": 0.30613499879837036, "lti_delta_gain_abs_max": 0.3701852560043335, "lti_effective_input_abs_max": 0.10064245760440826, "lti_effective_delta_abs_max": 0.1239333301782608, "recurrent_input_mixer_h_gate_mean": 0.7005914449691772, "recurrent_output_bridge_h_gate_mean": 0.7502783536911011, "recurrent_coda_input_rms": 1.140244960784912, "loop_rms": [1.603675, 1.515277, 1.479465, 1.448321], "mixed_rms": [2.147056, 1.954751, 1.852297, 1.785208], "delta_rms": [4.488133, 4.202742, 3.891623, 3.601259], "drive_rms": [1.765418, 1.667452, 1.56055, 1.461911], "h_e_cosine": [1.0, 0.946921, 0.846491, 0.757105], "h_delta_cosine": [0.145685, 0.427357, 0.604225, 0.706566]}
+
+(.venv) echoens@gx10-4fa2:~/Coding/Python/Mythos_P$ python training/train_dense_openr1.py eval \
+  --checkpoint runs/dense_openr1_recurrent_contract_python training/train_dense_openr1.py eval \
+  --checkpoint runs/dense_openr1_recurrent_contract_coda2/final.pt \
+  --dataset-path data/openr1_math_220k/hf_default_train \
+  --tokenizer Qwen/Qwen2.5-1.5B \
+  --max-seq-len 1024 \
+  --loss-on response \ drop \
+  --long-sample-policy drop \
+  --min-response-tokens 16 \
+  --pad-to-multiple 8 \32 \
+  --length-bucket-mult 32 \
+  --batch-size 4 \0 \
+  --max-batches 100 \
+  --num-workers 4 \
+  --n-loops 4 \\
+  --dtype bf16 \\
+  --device cuda \/eval_recurrent_contract_coda2_final.log
+  2>&1 | tee logs/eval_recurrent_contract_coda2_final.log
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{
+  "loss": 1.4422780523715664,
+  "lm_loss": 1.4422780523715664,
+  "ppl": 4.230321743131222,
+  "tokens": 117817,
+  "lti_A_min": 0.6644476652145386,
+  "lti_A_max": 0.6728574633598328,
+  "lti_tau_min": 2.4461889266967773,
+  "lti_tau_max": 2.523839235305786,
+  "lti_B_abs_max": 0.306640625,
+  "lti_input_gain_abs_max": 0.306640625,
+  "lti_delta_gain_abs_max": 0.37109375,
+  "lti_effective_input_abs_max": 0.10095536708831787,
+  "lti_effective_delta_abs_max": 0.1238659992814064,
+  "recurrent_input_mixer_h_gate_mean": 0.69921875,
+  "recurrent_output_bridge_h_gate_mean": 0.75,
+  "recurrent_coda_input_rms": 1.1108441352844238
+}
