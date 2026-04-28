@@ -21,3 +21,17 @@
 ## Monitor Training With Structured Events
 
 - For long Spark runs, write JSONL metric events directly from train/eval/exact-eval instead of relying on raw log scraping. Include body parameter counts, LTI gains, loop RMS, generation EOS/hit-max/repetition stats, and exact-match summaries so the Web UI can diagnose quality without reading `tee` logs manually.
+- Train-window metrics must be averaged over the same window and weighting. Do not display one microbatch's `lm_loss` next to a multi-step averaged objective loss; it looks like instability even when validation and averaged loss are smooth.
+- Epoch metrics must name their indexing convention explicitly. Use zero-based `epoch_index/current_epoch` for code-like progress and one-based `epoch_number` only for human display.
+
+## Dynamic Padding For Causal SFT
+
+- For right-padded causal LM batches, pad keys are future positions for real tokens, so real-token outputs stay correct without a separate padding attention mask. Always force pad labels to `-100`, log padding efficiency, and keep a `--static-padding` escape hatch for debugging fixed-shape behavior.
+
+## Recurrent LTI Defaults Must Match Loop Budget
+
+- For a fixed small recurrent budget such as 4 loops, LTI retention near `A=0.87` makes the delta path too weak at initialization. Check `1-A`, effective input/delta gains, and implied time constant against the actual loop count before treating recurrence as active.
+
+## Avoid Fake Adaptive Conditioning
+
+- AdaNorm conditioning should carry useful state or be removed. A constant loop-index-only condition is mostly a per-loop bias path and can hide that the recurrent state is not being used by the adaptive layer.

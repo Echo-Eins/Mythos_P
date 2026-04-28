@@ -147,6 +147,39 @@ def add_data_args(
             "are added; keep disabled for exact supervised math runs."
         ),
     )
+    parser.add_argument(
+        "--pad-to-multiple",
+        type=int,
+        default=8,
+        help=(
+            "Right-pad each dynamic batch to a multiple of this length. Use 1 "
+            "to disable alignment; 8 is a conservative tensor-core-friendly default."
+        ),
+    )
+    parser.add_argument(
+        "--static-padding",
+        action="store_true",
+        help=(
+            "Pad every batch to --max-seq-len. This reproduces the old fixed-shape "
+            "behavior and is mainly useful for debugging."
+        ),
+    )
+    parser.add_argument(
+        "--no-length-bucketing",
+        dest="length_bucketing",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable length-grouped training batches. By default, shuffled "
+            "mega-batches are locally sorted by sequence length to reduce padding."
+        ),
+    )
+    parser.add_argument(
+        "--length-bucket-mult",
+        type=int,
+        default=64,
+        help="Mega-batch size multiplier for length bucketing.",
+    )
 
 
 def add_model_args(parser: argparse.ArgumentParser) -> None:
@@ -162,8 +195,8 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rope-theta", type=float, default=500_000.0)
     parser.add_argument("--ada-norm", dest="use_ada_norm", action="store_true", default=True)
     parser.add_argument("--no-ada-norm", dest="use_ada_norm", action="store_false")
-    parser.add_argument("--lti-init-log-dt", type=float, default=-2.0)
-    parser.add_argument("--lti-init-input-gain", type=float, default=1.0)
+    parser.add_argument("--lti-init-log-dt", type=float, default=-0.5)
+    parser.add_argument("--lti-init-input-gain", type=float, default=0.3)
     parser.add_argument("--lti-init-delta-gain", type=float, default=0.35)
     parser.add_argument("--lti-max-input-gain", type=float, default=1.0)
     parser.add_argument("--lti-max-delta-gain", type=float, default=1.0)
@@ -178,8 +211,8 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument(
         "--max-epochs",
@@ -539,11 +572,14 @@ def build_token_sequences(
 
 class PackedCausalDataset(TorchDataset):
     """
-    Packs variable-length tokenized samples into fixed-length causal LM chunks.
+    Stores tokenized samples or packed chunks for causal LM training.
 
     Each item returns:
         input_ids = chunk[:-1]
         labels    = chunk[1:], with non-supervised tokens masked to -100.
+
+    Padding is deliberately handled by CausalBatchCollator.  Keeping the stored
+    chunks variable-length avoids spending attention compute on pad-only tails.
     """
 
     def __init__(
@@ -564,6 +600,8 @@ class PackedCausalDataset(TorchDataset):
         def append_chunk(ids: list[int], mask: list[int]) -> None:
             if len(ids) < 2 or sum(mask[1:]) == 0:
                 return
+            if len(ids) > seq_len + 1:
+                raise ValueError("sequence length exceeds packed chunk length")
             self.chunks.append((ids, mask))
 
         if not pack_samples:
@@ -572,19 +610,13 @@ class PackedCausalDataset(TorchDataset):
                     raise ValueError("token ids and label mask must have the same length")
                 if len(seq.ids) > seq_len + 1:
                     raise ValueError("sequence length exceeds packed chunk length")
-                pad_count = seq_len + 1 - len(seq.ids)
-                padded_ids = seq.ids + [pad_token_id] * pad_count
-                padded_mask = seq.label_mask + [0] * pad_count
-                append_chunk(padded_ids, padded_mask)
+                append_chunk(seq.ids, seq.label_mask)
             return
 
-        def flush_padded() -> None:
+        def flush_buffer() -> None:
             nonlocal token_buffer, mask_buffer
             if len(token_buffer) > 1:
-                pad_count = seq_len + 1 - len(token_buffer)
-                padded_ids = token_buffer + [pad_token_id] * pad_count
-                padded_mask = mask_buffer + [0] * pad_count
-                append_chunk(padded_ids, padded_mask)
+                append_chunk(token_buffer, mask_buffer)
             token_buffer = []
             mask_buffer = []
 
@@ -594,16 +626,19 @@ class PackedCausalDataset(TorchDataset):
             if len(seq.ids) > seq_len + 1:
                 raise ValueError("sequence length exceeds packed chunk length")
             if len(token_buffer) + len(seq.ids) > seq_len + 1:
-                flush_padded()
+                flush_buffer()
             if len(seq.ids) == seq_len + 1:
                 append_chunk(seq.ids, seq.label_mask)
                 continue
             token_buffer.extend(seq.ids)
             mask_buffer.extend(seq.label_mask)
-        flush_padded()
+        flush_buffer()
 
     def __len__(self) -> int:
         return len(self.chunks)
+
+    def input_lengths(self) -> list[int]:
+        return [len(ids) - 1 for ids, _ in self.chunks]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         ids, mask = self.chunks[idx]
@@ -613,6 +648,119 @@ class PackedCausalDataset(TorchDataset):
         labels[~label_mask] = -100
         labels[labels == self.pad_token_id] = -100
         return {"input_ids": input_ids, "labels": labels}
+
+
+class CausalBatchCollator:
+    """Right-pad causal LM items to the shortest safe batch-local length."""
+
+    def __init__(
+        self,
+        *,
+        pad_token_id: int,
+        max_seq_len: int,
+        pad_to_multiple: int = 8,
+        static_padding: bool = False,
+    ) -> None:
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if pad_to_multiple <= 0:
+            raise ValueError("--pad-to-multiple must be positive")
+        self.pad_token_id = pad_token_id
+        self.max_seq_len = max_seq_len
+        self.pad_to_multiple = pad_to_multiple
+        self.static_padding = static_padding
+
+    def _target_len(self, lengths: list[int]) -> int:
+        if not lengths:
+            raise ValueError("cannot collate an empty batch")
+        max_len = max(lengths)
+        if max_len > self.max_seq_len:
+            raise ValueError("batch item exceeds max_seq_len")
+        if self.static_padding:
+            return self.max_seq_len
+        if self.pad_to_multiple == 1:
+            return max_len
+        aligned = int(math.ceil(max_len / self.pad_to_multiple) * self.pad_to_multiple)
+        return min(aligned, self.max_seq_len)
+
+    def __call__(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        lengths = [int(item["input_ids"].numel()) for item in batch]
+        target_len = self._target_len(lengths)
+        batch_size = len(batch)
+
+        input_ids = torch.full(
+            (batch_size, target_len),
+            self.pad_token_id,
+            dtype=torch.long,
+        )
+        labels = torch.full((batch_size, target_len), -100, dtype=torch.long)
+        seq_lens = torch.tensor(lengths, dtype=torch.long)
+
+        for idx, item in enumerate(batch):
+            length = lengths[idx]
+            input_ids[idx, :length] = item["input_ids"]
+            labels[idx, :length] = item["labels"]
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "seq_lens": seq_lens,
+        }
+
+
+class LengthGroupedBatchSampler:
+    """
+    Stochastic length-grouped batch sampler.
+
+    Each epoch first shuffles all indices, then sorts short shuffled windows by
+    sequence length before forming batches.  This keeps enough randomness for
+    SFT while avoiding pathological batches that mix 80-token and 1024-token
+    samples under dynamic padding.
+    """
+
+    def __init__(
+        self,
+        *,
+        lengths: list[int],
+        batch_size: int,
+        drop_last: bool,
+        seed: int,
+        bucket_mult: int = 64,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if bucket_mult <= 0:
+            raise ValueError("--length-bucket-mult must be positive")
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        self.bucket_size = max(batch_size, batch_size * bucket_mult)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        indices = list(range(len(self.lengths)))
+        rng.shuffle(indices)
+
+        batches: list[list[int]] = []
+        for start in range(0, len(indices), self.bucket_size):
+            bucket = indices[start : start + self.bucket_size]
+            bucket.sort(key=lambda idx: self.lengths[idx], reverse=True)
+            for batch_start in range(0, len(bucket), self.batch_size):
+                batch = bucket[batch_start : batch_start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+
+        rng.shuffle(batches)
+        yield from batches
 
 
 def split_sequences(
@@ -631,6 +779,21 @@ def split_sequences(
     train_seq = [seq for idx, seq in enumerate(sequences) if idx not in val_set]
     val_seq = [seq for idx, seq in enumerate(sequences) if idx in val_set]
     return train_seq, val_seq
+
+
+def dataset_length_stats(ds: PackedCausalDataset) -> dict[str, float | int]:
+    lengths = ds.input_lengths()
+    if not lengths:
+        return {}
+    return {
+        "items": len(lengths),
+        "min_input_len": min(lengths),
+        "max_input_len": max(lengths),
+        "mean_input_len": sum(lengths) / len(lengths),
+        "static_padding_tokens": len(lengths) * ds.seq_len,
+        "unpadded_input_tokens": sum(lengths),
+        "static_padding_efficiency": sum(lengths) / max(1, len(lengths) * ds.seq_len),
+    }
 
 
 def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, DataLoader]:
@@ -669,20 +832,54 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
     if len(val_ds) == 0:
         raise ValueError("validation dataset has zero chunks")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+    args.data_stats = {
+        **data_stats,
+        "train_length_stats": dataset_length_stats(train_ds),
+        "val_length_stats": dataset_length_stats(val_ds),
+        "dynamic_padding": not args.static_padding,
+        "pad_to_multiple": args.pad_to_multiple,
+        "length_bucketing": args.length_bucketing,
+        "length_bucket_mult": args.length_bucket_mult,
+    }
+    collator = CausalBatchCollator(
+        pad_token_id=pad_id,
+        max_seq_len=args.max_seq_len,
+        pad_to_multiple=args.pad_to_multiple,
+        static_padding=args.static_padding,
     )
+
+    if args.length_bucketing:
+        train_sampler = LengthGroupedBatchSampler(
+            lengths=train_ds.input_lengths(),
+            batch_size=args.batch_size,
+            drop_last=True,
+            seed=args.seed,
+            bucket_mult=args.length_bucket_mult,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=collator,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+            collate_fn=collator,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=collator,
     )
     return train_loader, val_loader
 
@@ -895,10 +1092,13 @@ def epoch_metrics(
     updates_per_epoch = train_batches_per_epoch / max(1, grad_accum)
     target_epochs = max_steps / max(updates_per_epoch, 1e-12)
     epochs_seen = micro_batches_seen / train_batches_per_epoch
+    epoch_index = int(math.floor(epochs_seen))
     return {
         "epochs_seen": epochs_seen,
-        "current_epoch": int(math.floor(epochs_seen)) + 1,
-        "epoch_progress": epochs_seen - math.floor(epochs_seen),
+        "epoch_index": epoch_index,
+        "epoch_number": epoch_index + 1,
+        "current_epoch": epoch_index,
+        "epoch_progress": epochs_seen - epoch_index,
         "target_epochs": target_epochs,
         "updates_per_epoch": updates_per_epoch,
     }
@@ -957,6 +1157,8 @@ def evaluate(
         for key in (
             "lti_A_min",
             "lti_A_max",
+            "lti_tau_min",
+            "lti_tau_max",
             "lti_B_abs_max",
             "lti_input_gain_abs_max",
             "lti_delta_gain_abs_max",
@@ -966,6 +1168,7 @@ def evaluate(
             "act_ponder_loss",
             "act_expected_steps",
             "act_hard_steps",
+            "act_remainder",
             "act_halt_fraction",
             "act_halting_p_mean",
         ):
@@ -1060,6 +1263,10 @@ def train(args: argparse.Namespace) -> None:
         "long_sample_policy": args.long_sample_policy,
         "min_response_tokens": args.min_response_tokens,
         "pack_samples": args.pack_samples,
+        "dynamic_padding": not args.static_padding,
+        "pad_to_multiple": args.pad_to_multiple,
+        "length_bucketing": args.length_bucketing,
+        "length_bucket_mult": args.length_bucket_mult,
         "dim": cfg.dim,
         "n_heads": cfg.n_heads,
         "ffn_hidden_dim": cfg.resolved_ffn_hidden_dim(),
@@ -1082,16 +1289,24 @@ def train(args: argparse.Namespace) -> None:
     micro_batches_seen = start_micro_batches_seen
     completed_epoch_events = int(micro_batches_seen // train_batches_per_epoch)
     running_loss = 0.0
+    running_lm_loss = 0.0
+    running_act_loss = 0.0
     running_tokens = 0
+    running_real_input_tokens = 0
+    running_padded_input_tokens = 0
     t0 = time.perf_counter()
     model.train()
 
     for step in range(start_step, args.max_steps):
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
+        accum_lm_loss = 0.0
+        accum_act_loss = 0.0
         stats = None
         micro_batches: list[tuple[dict[str, torch.Tensor], int]] = []
         update_tokens = 0
+        update_real_input_tokens = 0
+        update_padded_input_tokens = 0
 
         for micro in range(args.grad_accum):
             try:
@@ -1123,6 +1338,8 @@ def train(args: argparse.Namespace) -> None:
                 continue
             micro_batches.append((batch, token_count))
             update_tokens += token_count
+            update_real_input_tokens += int(batch["seq_lens"].sum().item())
+            update_padded_input_tokens += int(batch["input_ids"].numel())
 
         if update_tokens == 0:
             raise RuntimeError("training update has zero supervised tokens")
@@ -1143,6 +1360,13 @@ def train(args: argparse.Namespace) -> None:
 
             loss.backward()
             accum_loss += float(loss.detach().cpu())
+            if out.stats is not None:
+                lm_loss_value = scalar_stat(out.stats, "lm_loss")
+                if lm_loss_value is not None:
+                    accum_lm_loss += lm_loss_value * (token_count / update_tokens)
+                act_loss_value = scalar_stat(out.stats, "act_loss")
+                if act_loss_value is not None:
+                    accum_act_loss += act_loss_value * (token_count / update_tokens)
             if out.stats is not None and (collect_micro_stats or stats is None):
                 stats = out.stats
 
@@ -1152,17 +1376,32 @@ def train(args: argparse.Namespace) -> None:
 
         step_num = step + 1
         running_loss += accum_loss
+        running_lm_loss += accum_lm_loss
+        running_act_loss += accum_act_loss
         running_tokens += update_tokens
+        running_real_input_tokens += update_real_input_tokens
+        running_padded_input_tokens += update_padded_input_tokens
 
         if step_num % args.log_every == 0:
             elapsed = max(time.perf_counter() - t0, 1e-6)
             tok_s = running_tokens / elapsed
+            input_tok_s = running_real_input_tokens / elapsed
+            padded_tok_s = running_padded_input_tokens / elapsed
             log: dict[str, Any] = {
                 "step": step_num,
                 "loss": running_loss / args.log_every,
+                "lm_loss": running_lm_loss / args.log_every,
                 "lr": scheduler.get_last_lr()[0],
                 "grad_norm": float(grad_norm),
                 "tok_s": tok_s,
+                "input_tok_s": input_tok_s,
+                "padded_tok_s": padded_tok_s,
+                "padding_efficiency": running_real_input_tokens
+                / max(1, running_padded_input_tokens),
+                "padded_seq_len_mean": running_padded_input_tokens
+                / max(1, args.log_every * args.grad_accum * args.batch_size),
+                "real_seq_len_mean": running_real_input_tokens
+                / max(1, args.log_every * args.grad_accum * args.batch_size),
                 "micro_batches_seen": micro_batches_seen,
                 "chunks_seen": micro_batches_seen * args.batch_size,
                 **epoch_metrics(
@@ -1172,22 +1411,25 @@ def train(args: argparse.Namespace) -> None:
                     grad_accum=args.grad_accum,
                 ),
             }
+            if running_act_loss > 0.0:
+                log["act_loss"] = running_act_loss / args.log_every
             if device.type == "cuda":
                 log["cuda_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
             if stats is not None:
                 for key in (
                     "lti_A_min",
                     "lti_A_max",
+                    "lti_tau_min",
+                    "lti_tau_max",
                     "lti_B_abs_max",
                     "lti_input_gain_abs_max",
                     "lti_delta_gain_abs_max",
                     "lti_effective_input_abs_max",
                     "lti_effective_delta_abs_max",
-                    "lm_loss",
-                    "act_loss",
                     "act_ponder_loss",
                     "act_expected_steps",
                     "act_hard_steps",
+                    "act_remainder",
                     "act_halt_fraction",
                     "act_halting_p_mean",
                 ):
@@ -1202,7 +1444,11 @@ def train(args: argparse.Namespace) -> None:
             print(json.dumps(log, ensure_ascii=False), flush=True)
             append_jsonl(metrics_path, {"event": "train", **log})
             running_loss = 0.0
+            running_lm_loss = 0.0
+            running_act_loss = 0.0
             running_tokens = 0
+            running_real_input_tokens = 0
+            running_padded_input_tokens = 0
             t0 = time.perf_counter()
 
         if step_num % args.eval_every == 0:

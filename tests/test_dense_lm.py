@@ -1,6 +1,7 @@
 import torch
 
 from open_mythos.dense_lm import DenseLMConfig, OpenMythosDenseLM
+from open_mythos.modules import add_loop_index_embedding
 
 
 def tiny_config() -> DenseLMConfig:
@@ -51,6 +52,14 @@ def test_lti_A_is_stable():
     A = model.recurrent.injection.A()
     assert A.min().item() > 0.0
     assert A.max().item() < 1.0
+    effective_delta = (1.0 - A) * model.recurrent.injection.delta_gain()
+    assert effective_delta.abs().mean().item() > 0.1
+
+
+def test_loop_index_embedding_matches_legacy_layout():
+    h = torch.zeros(1, 1, 8)
+    out = add_loop_index_embedding(h, loop_index=0, loop_dim=4)
+    assert torch.equal(out[0, 0, :4], torch.tensor([0.0, 0.0, 1.0, 1.0]))
 
 
 def test_forward_with_act_stats():

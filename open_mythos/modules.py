@@ -350,7 +350,8 @@ def add_loop_index_embedding(
     This is not sequence RoPE.  It is a depth-position bias that lets one
     weight-shared recurrent block distinguish early refinement steps from late
     refinement steps.  It is deliberately additive and parameter-free, so it can
-    be ablated cleanly.
+    be ablated cleanly.  The layout is [sin..., cos...] to match the legacy
+    loop index embedding in main.py.
     """
 
     _require(h.ndim == 3, "h must have shape (B, T, D)")
@@ -358,13 +359,14 @@ def add_loop_index_embedding(
     _require(loop_dim <= h.shape[-1], "loop_dim cannot exceed hidden dim")
     _require(loop_index >= 0, "loop_index must be non-negative")
 
+    half_dim = loop_dim // 2
     freqs = 1.0 / (
-        theta ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        theta ** (torch.arange(0, half_dim, device=h.device, dtype=h.dtype) / half_dim)
     )
     angles = loop_index * freqs
-    pair = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten()
+    loop_signal = torch.cat((angles.sin(), angles.cos()), dim=-1)
     emb = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
-    emb[:loop_dim] = pair
+    emb[:loop_dim] = loop_signal
     return h + emb.view(1, 1, -1)
 
 
@@ -916,8 +918,8 @@ class LTIInjection(nn.Module):
         dim: int,
         *,
         init_log_a: float = 0.0,
-        init_log_dt: float = -2.0,
-        init_input_gain: float = 1.0,
+        init_log_dt: float = -0.5,
+        init_input_gain: float = 0.3,
         init_delta_gain: float = 0.35,
         max_input_gain: float = 1.0,
         max_delta_gain: float = 1.0,
@@ -1014,6 +1016,7 @@ class ACTAccumulator:
         self.halted: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self.steps: Optional[torch.Tensor] = None
+        self.remainder: Optional[torch.Tensor] = None
 
     def step(
         self,
@@ -1030,15 +1033,18 @@ class ACTAccumulator:
             self.halted = torch.zeros_like(p, dtype=torch.bool)
             self.output = torch.zeros_like(h)
             self.steps = torch.zeros_like(p)
+            self.remainder = torch.zeros_like(p)
 
         assert self.halted is not None
         assert self.output is not None
         assert self.steps is not None
         assert self.cumulative is not None
+        assert self.remainder is not None
 
         running = ~self.halted
         remaining = (1.0 - self.cumulative).clamp(min=0.0, max=1.0)
         crosses = self.cumulative + p >= self.threshold
+        halting_now = running & (crosses | is_last)
 
         weight = torch.where(crosses | is_last, remaining, p)
         weight = weight * running.to(dtype=weight.dtype)
@@ -1046,6 +1052,7 @@ class ACTAccumulator:
         self.output = self.output + weight.unsqueeze(-1) * h
         self.cumulative = self.cumulative + weight
         self.steps = self.steps + running.to(dtype=self.steps.dtype)
+        self.remainder = torch.where(halting_now, remaining, self.remainder)
         self.halted = self.halted | crosses | is_last
         return self.output, weight
 
@@ -1093,7 +1100,8 @@ class MoERouter(nn.Module):
         probs = logits.softmax(dim=-1)
         _, indices = (logits + self.router_bias).topk(self.top_k, dim=-1)
         weights = probs.gather(dim=-1, index=indices)
-        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        if self.top_k > 1:
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
         one_hot = F.one_hot(indices, num_classes=self.n_routed_experts).float()
         expert_load = one_hot.sum(dim=(0, 1)) if one_hot.ndim == 3 else one_hot.sum(0)
@@ -1193,9 +1201,8 @@ class SparseMoE(nn.Module):
                 continue
             token_idx = token_slot // self.cfg.n_experts_per_token
             rank_idx = token_slot % self.cfg.n_experts_per_token
-            routed_out[token_idx] += (
-                expert(flat[token_idx]) * weights[token_idx, rank_idx].unsqueeze(-1)
-            )
+            expert_out = expert(flat[token_idx]) * weights[token_idx, rank_idx].unsqueeze(-1)
+            routed_out.index_add_(0, token_idx, expert_out)
 
         if self.shared is not None:
             routed_out = routed_out + self.shared(flat)
@@ -1223,7 +1230,7 @@ class DenseRecurrentBlock(nn.Module):
 
     Loop body:
 
-        base_t  = norm(h_t + e + loop_embedding(t))
+        base_t  = norm(h_t + loop_embedding(t))
         delta_t = TransformerBlock(base_t) - base_t
         h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
 
@@ -1286,8 +1293,8 @@ class DenseRecurrentBlock(nn.Module):
 
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
-            norm_cond = (h_loop - h)[..., : self.loop_dim]
-            base = self.norm(h_loop + e, norm_cond)
+            norm_cond = h_loop[..., : self.loop_dim]
+            base = self.norm(h_loop, norm_cond)
             delta = self.block.forward_delta(
                 base,
                 cache=cache,
