@@ -23,6 +23,7 @@
 - For long Spark runs, write JSONL metric events directly from train/eval/exact-eval instead of relying on raw log scraping. Include body parameter counts, LTI gains, loop RMS, generation EOS/hit-max/repetition stats, and exact-match summaries so the Web UI can diagnose quality without reading `tee` logs manually.
 - Train-window metrics must be averaged over the same window and weighting. Do not display one microbatch's `lm_loss` next to a multi-step averaged objective loss; it looks like instability even when validation and averaged loss are smooth.
 - Epoch metrics must name their indexing convention explicitly. Use zero-based `epoch_index/current_epoch` for code-like progress and one-based `epoch_number` only for human display.
+- Any direct `json.dumps` of CLI payloads must pass through `json_safe` or pre-stringify `Path` values. `append_jsonl` already handles this, but console prints can still crash Spark-side eval before the first sample.
 
 ## Dynamic Padding For Causal SFT
 

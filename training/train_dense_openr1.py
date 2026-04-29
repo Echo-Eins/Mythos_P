@@ -1594,7 +1594,7 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
         "top_p": args.top_p,
         "predictions_path": args.predictions_path,
     }
-    print(json.dumps(start_payload, ensure_ascii=False, indent=2), flush=True)
+    print(json.dumps(json_safe(start_payload), ensure_ascii=False, indent=2), flush=True)
     append_jsonl(args.metrics_jsonl, start_payload)
 
     evaluated = 0
@@ -1721,6 +1721,7 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
             pred_fp.close()
 
     metrics = {
+        "n_loops": args.n_loops,
         "evaluated": evaluated,
         "correct": correct,
         "exact_match": correct / max(1, evaluated),

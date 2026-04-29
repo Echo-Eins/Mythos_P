@@ -193,3 +193,73 @@
 - Reference MoE top-1 routing keeps gate probability gradients, and routed accumulation uses `index_add_`.
 - ACT logs `act_remainder` and uses `hard_steps + remainder` for the ponder objective.
 - Syntax verification passed with `py -3 -m py_compile` for model, training, and tests.
+
+# 117M Dense No-ACT Log Comparison
+
+- [x] Read local project rules, lessons, and current prototype/audit docs.
+- [x] Parse `logs/27_04 no act 1536_117M` train/eval metrics.
+- [x] Compare against earlier no-ACT/ACT runs.
+- [x] Decide what signal is needed before testing new modules.
+- [x] Add review notes with the final diagnosis.
+
+## 117M Dense No-ACT Log Review
+
+- `logs/27_04 no act 1536_117M` completed one epoch: `epoch_end` at step 5200, with only an 8-chunk grad-accumulation spill into the next epoch.
+- This run is not the latest LTI-fixed configuration: it used `lti_init_log_dt=-2.0`, `lti_init_input_gain=1.0`, `lti_init_delta_gain=0.35`.
+- Teacher-forced validation improved to the best value so far: eval loss `1.4741`, PPL `4.3672` at step 5000, compared with the previous no-ACT 1024 run ending at loss `1.6165`, PPL `5.0355`.
+- At the same 2000-update point, the 117M-body run was worse than the 1024 run (`1.7903` vs `1.6165` eval loss), so the win came from longer training through a full epoch and larger capacity, not faster early convergence.
+- Dynamic padding behaved correctly and efficiently: static-padding efficiency was about `0.406`, while runtime padding efficiency stayed around `0.98`.
+- LTI remained too inert in this completed run: effective delta only grew from about `0.044` to `0.063`, so the current LTI-fixed run is still the important ablation before adding modules.
+- No exact-answer or generation diagnostics are present in this log, so this run proves lower response-token PPL, not answer correctness.
+
+# 117M Dense No-ACT LTI-Fixed Step-2000 Log Review
+
+- [x] Confirm the log is from the latest LTI/double-injection fixes.
+- [x] Parse startup, train, eval, LTI, loop RMS, padding, and epoch metrics.
+- [x] Compare against the previous 117M dynpad run and 1024 no-ACT baseline at similar steps.
+- [x] Record whether the current run is stable enough to continue to exact-eval.
+
+## 117M Dense No-ACT LTI-Fixed Step-2000 Review
+
+- `logs/27_04_4 no act 1536_117M 1536 dynpad b4_3` is from updated code because it logs `lti_tau_min/max`, but it still passes the old LTI flags: `lti_init_log_dt=-2.0`, `lti_init_input_gain=1.0`, `lti_init_delta_gain=0.35`.
+- The run reached step 2030, about `0.3904` of epoch 0. There is no epoch completion or exact-eval in this log.
+- At step 2000, validation is essentially unchanged vs the previous 117M dynpad run: new eval loss `1.7955`, PPL `6.0223`; old eval loss `1.7903`, PPL `5.9911`.
+- Train stability is normal: step-2000 grad norm `0.960`, no NaN/inf/traceback, CUDA memory about `17.39 GB`.
+- Dynamic padding remains effective: step-2000 padding efficiency `0.9775`; last-50-step average around `0.978`.
+- LTI is only slightly more active than the previous run at the same step: effective delta `0.0566` vs old `0.0555`, and effective input `0.1516` vs old `0.1499`.
+- This log does not test the intended aggressive LTI initialization (`-0.5`, `0.3`, `0.35`), so it is not the decisive LTI-fixed ablation.
+
+# Analysis1 Architecture Rework Planning
+
+- [x] Read `Analysis1`, project rules, lessons, and current architecture plans.
+- [x] Parse `logs/28_04_5 no act 1536 117M dynpad b4_4_RB fix` and verify Analysis1 metrics.
+- [x] Re-read active dense model, recurrent core, LTI injection, optimizer, batching, and eval/generation code.
+- [x] Check literature claims against primary sources where the claim affects implementation priority.
+- [x] Produce a staged implementation plan focused on accuracy, stability, and efficiency.
+
+## Analysis1 Architecture Rework Review
+
+- Added `tasks/architecture_rework_plan.md`.
+- Confirmed the latest run is stable and dynamic padding works, with eval loss `1.4489` and PPL `4.2582` at step 5000.
+- Confirmed the active recurrent core still has a structural contract problem: the transformer update sees `h + loop_embedding`, while `e` enters only through LTI injection.
+- Confirmed `loop_rms` shrinks across loops, but treated it as scale attenuation rather than proof of lost information until extra recurrent diagnostics are logged.
+- Corrected Analysis1 where it suggested directly restoring `h + e`, blindly increasing LTI input gain, treating `pin_memory` as missing, or prioritizing tokenizer trimming/MXFP4 before recurrent-depth correctness.
+- The staged plan prioritizes measurement, learned `(h, e)` recurrent mixing, recurrent output normalization/bridge, random-depth training, truncated recurrent-depth BPTT, optimizer param groups, and only then depth-wise LoRA/selective LTI experiments.
+
+# Loop Sweep Test Log Analysis
+
+- [x] Locate `logs/Tests 28_04` files and identify which commands produced them.
+- [x] Parse teacher-forced eval metrics by `n_loops`.
+- [x] Parse exact-eval/generation diagnostics by `n_loops`.
+- [x] Decide whether the current recurrence benefits from deeper inference.
+- [x] Record next implementation step from the results.
+
+## Loop Sweep Test Log Review
+
+- Teacher-forced eval confirms trained depth is the sweet spot: loss goes `1.7163` at 1 loop, `1.4948` at 2 loops, best `1.3895` at 4 loops, then worsens to `1.4075` at 6 and `1.4216` at 8.
+- This means recurrence is not useless: 4 loops beat 1 loop by about `0.327` loss and 2 loops by about `0.105` loss.
+- It also means there is no depth extrapolation yet: extra inference loops beyond the trained depth degrade quality.
+- Exact-eval did not run; it crashed before generation because `exact_eval_start` printed a `Path` through raw `json.dumps`.
+- Fixed exact-eval JSON serialization in `training/train_dense_openr1.py` and added `n_loops` to final exact-eval metrics.
+- Verified syntax with `py -3 -m py_compile training/train_dense_openr1.py`.
+- Next step is to rerun exact-eval loop sweep on the same checkpoint, then implement recurrent mixer/output bridge if exact-eval agrees with teacher-forced degradation beyond 4 loops.
