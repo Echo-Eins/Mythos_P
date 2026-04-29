@@ -43,3 +43,4 @@
 
 - Before asking for another hour-scale training run, provide a fast `preflight` command that exercises dataset loading, label/EOS checks, model construction, forward, backward, eval, generation, and optional save/load. Bugs that can be caught in one or two batches should not be discovered after a long training launch.
 - Optional architecture branches should not allocate inactive trainable modules. If ACT is disabled, do not keep unused ACT parameters in the no-ACT optimizer or parameter count; make compatibility for older checkpoints explicit instead.
+- With `torch.compile(..., mode="reduce-overhead")`, treat CUDA Graph forward outputs as short-lived. Clone/detach scalar losses and logging stats immediately after forward, before any later compiled model call can overwrite graph output storage.

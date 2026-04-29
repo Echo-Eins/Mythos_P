@@ -324,3 +324,16 @@
 - Removed unused ACT trainable parameters from no-ACT models and made old no-ACT checkpoint ACT keys explicitly ignored with a compatibility warning.
 - Added regression tests for EOS labels when `pad_token_id == eos_token_id`, invalid attention counts, and no-ACT parameter hygiene.
 - Verified local syntax with `py -3 -m py_compile open_mythos\dense_lm.py training\train_dense_openr1.py tests\test_dense_lm.py tests\test_dynamic_padding.py`; runtime torch tests remain Spark-side because this Windows machine intentionally has no torch runtime.
+
+# Compile CUDA Graph Output Snapshot Fix
+
+- [x] Fix `torch.compile(..., reduce-overhead)` preflight crash caused by reading compiled forward outputs after later model invocations.
+- [x] Apply the same tensor-output snapshot rule to eval/train stats so logging cannot trip CUDA Graph output overwrite.
+- [x] Verify syntax locally and require Spark-side compile preflight rerun before compile training.
+
+## Compile Snapshot Review
+
+- Added `snapshot_tensor_outputs()` and use it immediately after compiled forward calls for long-lived logging/eval stats.
+- `preflight` now materializes loss and stats before backward/eval/generation/save-load can issue later compiled model calls.
+- `evaluate()` and the train logging path now keep CPU-cloned stats rather than CUDA Graph output tensors.
+- Verified syntax with `py -3 -m py_compile training\train_dense_openr1.py`; Spark-side compile preflight must be rerun because local torch is unavailable.

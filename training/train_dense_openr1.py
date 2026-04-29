@@ -1239,6 +1239,26 @@ def print_json(payload: dict[str, Any], *, indent: Optional[int] = None) -> None
     print(json.dumps(json_safe(payload), ensure_ascii=False, indent=indent), flush=True)
 
 
+def snapshot_tensor_outputs(value: Any) -> Any:
+    """
+    Clone tensor outputs before another compiled model invocation can overwrite them.
+
+    `torch.compile(..., mode="reduce-overhead")` may use CUDA Graphs.  CUDA Graph
+    output tensors can be reused by later compiled calls, so long-lived logging
+    values must be detached and cloned immediately after forward.
+    """
+
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: snapshot_tensor_outputs(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [snapshot_tensor_outputs(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(snapshot_tensor_outputs(item) for item in value)
+    return value
+
+
 def epoch_metrics(
     *,
     micro_batches_seen: int,
@@ -1296,12 +1316,13 @@ def evaluate(
         if out.loss is None:
             raise RuntimeError("model returned no loss during evaluation")
         objective_loss = float(out.loss.detach().cpu())
-        lm_loss = scalar_stat(out.stats, "lm_loss") if out.stats is not None else None
+        out_stats = snapshot_tensor_outputs(out.stats) if out.stats is not None else None
+        lm_loss = scalar_stat(out_stats, "lm_loss") if out_stats is not None else None
         objective_loss_sum += objective_loss * token_count
         lm_loss_sum += (objective_loss if lm_loss is None else lm_loss) * token_count
         supervised_tokens += token_count
-        if first_stats is None and out.stats is not None:
-            first_stats = out.stats
+        if first_stats is None and out_stats is not None:
+            first_stats = out_stats
     if supervised_tokens == 0:
         raise ValueError("evaluation produced zero supervised tokens")
     mean_objective_loss = objective_loss_sum / supervised_tokens
@@ -1531,8 +1552,11 @@ def preflight_cmd(args: argparse.Namespace) -> None:
         )
     if out.loss is None:
         raise RuntimeError("preflight forward returned no loss")
-    if not bool(torch.isfinite(out.loss.detach()).item()):
+    preflight_loss_tensor = out.loss.detach()
+    if not bool(torch.isfinite(preflight_loss_tensor).item()):
         raise RuntimeError("preflight forward returned a non-finite loss")
+    preflight_loss = float(preflight_loss_tensor.cpu().item())
+    preflight_stats = snapshot_tensor_outputs(out.stats) if out.stats is not None else None
 
     grad_norm_value: Optional[float] = None
     if args.run_backward:
@@ -1583,15 +1607,15 @@ def preflight_cmd(args: argparse.Namespace) -> None:
 
     summary = {
         "event": "preflight_ok",
-        "loss": float(out.loss.detach().cpu()),
-        "lm_loss": scalar_stat(out.stats, "lm_loss") if out.stats is not None else None,
+        "loss": preflight_loss,
+        "lm_loss": scalar_stat(preflight_stats, "lm_loss") if preflight_stats is not None else None,
         "grad_norm": grad_norm_value,
         "lr_after_step": scheduler.get_last_lr()[0],
         "eval": eval_metrics,
         "generated_shape": generated_shape,
         "checkpoint_path": checkpoint_path,
     }
-    if out.stats is not None:
+    if preflight_stats is not None:
         for key in (
             "lti_A_min",
             "lti_A_max",
@@ -1605,7 +1629,7 @@ def preflight_cmd(args: argparse.Namespace) -> None:
             "recurrent_output_bridge_h_gate_mean",
             "recurrent_coda_input_rms",
         ):
-            value = scalar_stat(out.stats, key)
+            value = scalar_stat(preflight_stats, key)
             if value is not None:
                 summary[key] = value
     print_json(summary, indent=2)
@@ -1796,15 +1820,16 @@ def train(args: argparse.Namespace) -> None:
 
             loss.backward()
             accum_loss += float(loss.detach().cpu())
-            if out.stats is not None:
-                lm_loss_value = scalar_stat(out.stats, "lm_loss")
+            out_stats = snapshot_tensor_outputs(out.stats) if out.stats is not None else None
+            if out_stats is not None:
+                lm_loss_value = scalar_stat(out_stats, "lm_loss")
                 if lm_loss_value is not None:
                     accum_lm_loss += lm_loss_value * (token_count / update_tokens)
-                act_loss_value = scalar_stat(out.stats, "act_loss")
+                act_loss_value = scalar_stat(out_stats, "act_loss")
                 if act_loss_value is not None:
                     accum_act_loss += act_loss_value * (token_count / update_tokens)
-            if out.stats is not None and (collect_micro_stats or stats is None):
-                stats = out.stats
+            if out_stats is not None and (collect_micro_stats or stats is None):
+                stats = out_stats
 
         base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
