@@ -47,7 +47,7 @@ class DenseLMConfig:
     n_heads: int = 24
     n_kv_heads: Optional[int] = None
     prelude_layers: int = 2
-    coda_layers: int = 1
+    coda_layers: int = 2
     max_loop_iters: int = 4
     max_seq_len: int = 2048
     ffn_hidden_dim: Optional[int] = None
@@ -56,11 +56,13 @@ class DenseLMConfig:
     rope_theta: float = 500_000.0
     norm_eps: float = 1e-6
     use_ada_norm: bool = True
-    lti_init_log_dt: float = -0.5
+    lti_init_log_dt: float = -1.0
     lti_init_input_gain: float = 0.3
     lti_init_delta_gain: float = 0.35
     lti_max_input_gain: float = 1.0
     lti_max_delta_gain: float = 1.0
+    recurrent_input_h_init: float = 0.7
+    recurrent_output_h_init: float = 0.75
     tie_embeddings: bool = True
     init_std: float = 0.02
     use_act: bool = False
@@ -108,6 +110,10 @@ class DenseLMConfig:
             raise ValueError("abs(lti_init_input_gain) cannot exceed lti_max_input_gain")
         if abs(self.lti_init_delta_gain) > self.lti_max_delta_gain:
             raise ValueError("abs(lti_init_delta_gain) cannot exceed lti_max_delta_gain")
+        if not (0.0 < self.recurrent_input_h_init < 1.0):
+            raise ValueError("recurrent_input_h_init must be in (0, 1)")
+        if not (0.0 < self.recurrent_output_h_init < 1.0):
+            raise ValueError("recurrent_output_h_init must be in (0, 1)")
         if not (0.0 < self.act_threshold <= 1.0):
             raise ValueError("act_threshold must be in (0, 1]")
         if self.act_ponder_weight < 0.0:
@@ -135,6 +141,77 @@ class DenseLMOutput:
     logits: torch.Tensor
     loss: Optional[torch.Tensor] = None
     stats: Optional[dict[str, Any]] = None
+
+
+def _logit_probability(value: float) -> float:
+    if not (0.0 < value < 1.0):
+        raise ValueError("probability must be in (0, 1)")
+    return math.log(value / (1.0 - value))
+
+
+class RecurrentInputMixer(nn.Module):
+    """
+    Learned coupling between recurrent state h and encoded input e.
+
+    The previous recurrent transformer only saw h + loop_embedding, while e
+    reached the update through the direct LTI drive.  This mixer gives the
+    transformer an explicit, bounded view of both streams without reverting to
+    raw h + e double input dominance.
+    """
+
+    def __init__(self, dim: int, eps: float, *, init_h_weight: float) -> None:
+        super().__init__()
+        self.h_norm = RMSNorm(dim, eps)
+        self.e_norm = RMSNorm(dim, eps)
+        self.raw_h_gate = nn.Parameter(
+            torch.full((dim,), _logit_probability(init_h_weight))
+        )
+        self.residual_proj = nn.Linear(2 * dim, dim, bias=False)
+        self.residual_proj._open_mythos_zero_init = True
+
+    def h_gate(self) -> torch.Tensor:
+        return torch.sigmoid(self.raw_h_gate)
+
+    def forward(self, h: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        if h.shape != e.shape:
+            raise ValueError("h and e must have identical shapes")
+        h_base = self.h_norm(h)
+        e_base = self.e_norm(e)
+        gate = self.h_gate().to(dtype=h.dtype, device=h.device).view(1, 1, -1)
+        residual = self.residual_proj(torch.cat((h_base, e_base), dim=-1))
+        return gate * h + (1.0 - gate) * e + residual
+
+
+class RecurrentOutputBridge(nn.Module):
+    """
+    Stabilized readout bridge from recurrent state into coda blocks.
+
+    Coda should not receive an unnormalized, LTI-attenuated h_T alone.  This
+    bridge normalizes h, preserves a controlled e skip, and keeps a zero-init
+    residual projection available for learned h/e fusion.
+    """
+
+    def __init__(self, dim: int, eps: float, *, init_h_weight: float) -> None:
+        super().__init__()
+        self.h_norm = RMSNorm(dim, eps)
+        self.e_norm = RMSNorm(dim, eps)
+        self.raw_h_gate = nn.Parameter(
+            torch.full((dim,), _logit_probability(init_h_weight))
+        )
+        self.residual_proj = nn.Linear(2 * dim, dim, bias=False)
+        self.residual_proj._open_mythos_zero_init = True
+
+    def h_gate(self) -> torch.Tensor:
+        return torch.sigmoid(self.raw_h_gate)
+
+    def forward(self, h: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        if h.shape != e.shape:
+            raise ValueError("h and e must have identical shapes")
+        h_base = self.h_norm(h)
+        e_base = self.e_norm(e)
+        gate = self.h_gate().to(dtype=h.dtype, device=h.device).view(1, 1, -1)
+        residual = self.residual_proj(torch.cat((h_base, e_base), dim=-1))
+        return gate * h_base + (1.0 - gate) * e_base + residual
 
 
 class DenseRecurrentCore(nn.Module):
@@ -165,6 +242,11 @@ class DenseRecurrentCore(nn.Module):
         self.cfg = cfg
         self.loop_dim = loop_dim
         self.norm = self._make_norm()
+        self.input_mixer = RecurrentInputMixer(
+            cfg.dim,
+            cfg.norm_eps,
+            init_h_weight=cfg.recurrent_input_h_init,
+        )
         self.block = DenseTransformerBlock(
             AttentionConfig(
                 dim=cfg.dim,
@@ -213,6 +295,11 @@ class DenseRecurrentCore(nn.Module):
             raise ValueError("n_loops must be positive")
 
         loop_rms: list[torch.Tensor] = []
+        mixed_rms: list[torch.Tensor] = []
+        delta_rms: list[torch.Tensor] = []
+        drive_rms: list[torch.Tensor] = []
+        h_e_cosine: list[torch.Tensor] = []
+        h_delta_cosine: list[torch.Tensor] = []
         act_p_means: list[torch.Tensor] = []
         accumulator = ACTAccumulator(self.cfg.act_threshold) if self.cfg.use_act else None
         expected_steps: Optional[torch.Tensor] = None
@@ -221,13 +308,29 @@ class DenseRecurrentCore(nn.Module):
         for loop_index in range(loops):
             h_loop = add_loop_index_embedding(h, loop_index, self.loop_dim)
             norm_cond = h_loop[..., : self.loop_dim]
-            base = self.norm(h_loop, norm_cond)
+            mixed = self.input_mixer(h_loop, e)
+            base = self.norm(mixed, norm_cond)
             delta = self.block.forward_delta(
                 base,
                 cache=None,
                 layer_key=f"recurrent.loop_{loop_index}",
                 norm_cond=norm_cond,
             )
+            if collect_stats:
+                input_gain = self.injection.input_gain().to(dtype=h.dtype, device=h.device)
+                delta_gain = self.injection.delta_gain().to(dtype=h.dtype, device=h.device)
+                input_drive = input_gain.view(1, 1, -1) * e
+                delta_drive = delta_gain.view(1, 1, -1) * delta
+                drive = input_drive + delta_drive
+                mixed_rms.append(mixed.float().pow(2).mean().sqrt().detach())
+                delta_rms.append(delta.float().pow(2).mean().sqrt().detach())
+                drive_rms.append(drive.float().pow(2).mean().sqrt().detach())
+                h_e_cosine.append(
+                    F.cosine_similarity(h.float(), e.float(), dim=-1).mean().detach()
+                )
+                h_delta_cosine.append(
+                    F.cosine_similarity(h.float(), delta.float(), dim=-1).mean().detach()
+                )
             h = self.injection(h, e, delta)
             if collect_stats:
                 loop_rms.append(h.float().pow(2).mean().sqrt().detach())
@@ -267,6 +370,18 @@ class DenseRecurrentCore(nn.Module):
                 stats.update(
                     {
                         "recurrent_loop_rms": torch.stack(loop_rms) if loop_rms else None,
+                        "recurrent_mixed_rms": torch.stack(mixed_rms) if mixed_rms else None,
+                        "recurrent_delta_rms": torch.stack(delta_rms) if delta_rms else None,
+                        "recurrent_drive_rms": torch.stack(drive_rms) if drive_rms else None,
+                        "recurrent_h_e_cosine": torch.stack(h_e_cosine)
+                        if h_e_cosine
+                        else None,
+                        "recurrent_h_delta_cosine": torch.stack(h_delta_cosine)
+                        if h_delta_cosine
+                        else None,
+                        "recurrent_input_mixer_h_gate_mean": self.input_mixer.h_gate()
+                        .detach()
+                        .mean(),
                         "lti_A_min": A.min(),
                         "lti_A_max": A.max(),
                         "lti_tau_min": (-1.0 / A.log()).min(),
@@ -341,6 +456,11 @@ class OpenMythosDenseLM(nn.Module):
         )
 
         self.recurrent = DenseRecurrentCore(cfg)
+        self.recurrent_output_bridge = RecurrentOutputBridge(
+            cfg.dim,
+            cfg.norm_eps,
+            init_h_weight=cfg.recurrent_output_h_init,
+        )
 
         self.coda = nn.ModuleList(
             [
@@ -393,9 +513,10 @@ class OpenMythosDenseLM(nn.Module):
         lm_head = 0 if self.cfg.tie_embeddings else count(self.lm_head)
         prelude = count(self.prelude)
         recurrent = count(self.recurrent)
+        recurrent_bridge = count(self.recurrent_output_bridge)
         coda = count(self.coda)
         final_norm = count(self.norm)
-        body = prelude + recurrent + coda + final_norm
+        body = prelude + recurrent + recurrent_bridge + coda + final_norm
         return {
             "total": self.num_parameters(),
             "body": body,
@@ -403,6 +524,7 @@ class OpenMythosDenseLM(nn.Module):
             "lm_head": lm_head,
             "prelude": prelude,
             "recurrent": recurrent,
+            "recurrent_bridge": recurrent_bridge,
             "coda": coda,
             "final_norm": final_norm,
         }
@@ -433,6 +555,16 @@ class OpenMythosDenseLM(nn.Module):
             n_loops=n_loops,
             collect_stats=collect_stats,
         )
+        x = self.recurrent_output_bridge(x, e)
+        if collect_stats:
+            if recurrent_stats is None:
+                recurrent_stats = {}
+            recurrent_stats["recurrent_coda_input_rms"] = (
+                x.float().pow(2).mean().sqrt().detach()
+            )
+            recurrent_stats["recurrent_output_bridge_h_gate_mean"] = (
+                self.recurrent_output_bridge.h_gate().detach().mean()
+            )
 
         for idx, block in enumerate(self.coda):
             x = block(x, cache=None, layer_key=f"coda.{idx}")

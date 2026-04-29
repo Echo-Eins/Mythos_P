@@ -30,6 +30,10 @@ def test_forward_loss_shape():
     assert out.loss is not None
     assert out.stats is not None
     assert not torch.isnan(out.logits).any()
+    assert "recurrent_input_mixer_h_gate_mean" in out.stats
+    assert "recurrent_output_bridge_h_gate_mean" in out.stats
+    assert "recurrent_coda_input_rms" in out.stats
+    assert "recurrent_delta_rms" in out.stats
 
 
 def test_generate_no_cache():
@@ -54,6 +58,23 @@ def test_lti_A_is_stable():
     assert A.max().item() < 1.0
     effective_delta = (1.0 - A) * model.recurrent.injection.delta_gain()
     assert effective_delta.abs().mean().item() > 0.1
+
+
+def test_recurrent_mixers_start_with_configured_gates():
+    cfg = tiny_config()
+    cfg.recurrent_input_h_init = 0.7
+    cfg.recurrent_output_h_init = 0.75
+    model = OpenMythosDenseLM(cfg)
+    assert torch.allclose(
+        model.recurrent.input_mixer.h_gate().mean(),
+        torch.tensor(0.7),
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        model.recurrent_output_bridge.h_gate().mean(),
+        torch.tensor(0.75),
+        atol=1e-5,
+    )
 
 
 def test_loop_index_embedding_matches_legacy_layout():

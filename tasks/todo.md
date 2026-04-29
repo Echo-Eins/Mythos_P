@@ -263,3 +263,45 @@
 - Fixed exact-eval JSON serialization in `training/train_dense_openr1.py` and added `n_loops` to final exact-eval metrics.
 - Verified syntax with `py -3 -m py_compile training/train_dense_openr1.py`.
 - Next step is to rerun exact-eval loop sweep on the same checkpoint, then implement recurrent mixer/output bridge if exact-eval agrees with teacher-forced degradation beyond 4 loops.
+
+# Exact Loop Sweep Test 28_04_2
+
+- [x] Locate `logs/tests 28_04_2` and `evals/loop_sweep_current` artifacts.
+- [x] Parse exact-eval metrics by `n_loops`.
+- [x] Inspect prediction JSONL files for EOS, max-token, repetition, and answer extraction behavior.
+- [x] Compare exact-eval against teacher-forced loop sweep.
+- [x] Record the architecture decision and next implementation step.
+
+## Exact Loop Sweep Test 28_04_2 Review
+
+- Exact-eval completed for loops `1, 2, 4, 6, 8`, with `100` evaluated samples per depth and `0/100` exact matches at every depth.
+- Every depth has `eos_rate=0.0`, `hit_max_new_tokens_rate=1.0`, and `avg_generated_tokens=512.0`; generation is not terminating.
+- Repetition is catastrophic but improves slightly with depth: average repeated 4-gram ratio is `0.9250` at 1 loop, `0.8961` at 2, `0.8838` at 4, `0.8771` at 6, and `0.8793` at 8.
+- Prediction JSONL confirms the issue is real generation collapse, not just strict exact-match: outputs repeat formulas/numbers until max length.
+- Root cause found in the training dataset path: the run config has `pad_token_id == eos_token_id == 151643`, while `PackedCausalDataset.__getitem__` masked `labels[labels == pad_token_id] = -100`, removing every EOS target from training.
+- Fixed the EOS masking bug by relying on the collator's padded `-100` labels instead of masking labels by token id.
+- Verified syntax with `py -3 -m py_compile training/train_dense_openr1.py`.
+- The current checkpoint cannot prove answer quality because it was trained without EOS supervision; the next serious run must be retrained or at least continued after this label fix before exact-eval is meaningful.
+
+# Recurrent Contract Architecture Pass
+
+- [x] Add learned `(h, e)` recurrent input mixer instead of raw `h + e`.
+- [x] Add recurrent output normalization and output bridge into coda.
+- [x] Raise recommended/default coda depth to `2`.
+- [x] Set LTI default time constant for deeper loops (`init_log_dt=-1.0`).
+- [x] Add optimizer param groups so embeddings, norms, LTI scalars, biases, and gates are not weight-decayed.
+- [x] Update runtime defaults: `grad_accum=16`, `length_bucket_mult=32`, `num_workers=4`, compile mode support, DataLoader persistent workers/prefetch.
+- [x] Add diagnostics/tests for mixer/bridge and verify syntax.
+
+## Recurrent Contract Architecture Pass Review
+
+- `OpenMythosDenseLM` now defaults to `coda_layers=2` and `lti_init_log_dt=-1.0`.
+- `DenseRecurrentCore` now uses `RecurrentInputMixer`, initialized at `70% h / 30% e`, so the shared recurrent transformer sees both recurrent state and encoded prompt state without raw `h + e` double dominance.
+- The recurrent output now passes through `RecurrentOutputBridge`, initialized at `75% normalized h / 25% normalized e`, before coda blocks.
+- Added recurrent diagnostics: mixed RMS, delta RMS, drive RMS, h/e cosine, h/delta cosine, input mixer gate, output bridge gate, and coda-input RMS.
+- Training defaults now match the serious-run plan: `coda_layers=2`, `grad_accum=16`, `length_bucket_mult=32`, `num_workers=4`, `warmup_steps=200`, and `init_log_dt=-1.0`.
+- DataLoaders use persistent workers and configurable prefetching when worker processes are enabled.
+- AdamW now uses decay/no-decay parameter groups; embeddings, tied head, norms, LTI parameters, biases, scalar gates, and other 1D parameters are excluded from weight decay.
+- `torch.compile` supports `--compile-mode`, defaulting to `reduce-overhead` when `--compile` is passed.
+- Tests were extended for mixer/bridge diagnostics and configured gate initialization.
+- Verified syntax with `py -3 -m py_compile open_mythos/dense_lm.py training/train_dense_openr1.py tests/test_dense_lm.py`.

@@ -9,6 +9,7 @@
 ## Supervised Math Runs Need Response-Only Loss
 
 - For OpenR1-style SFT, do not optimize the model to predict the problem header and prompt by default. Mask prompt tokens, keep loss on solution/answer tokens, avoid splitting one sample across independent chunks, and do not force EOS onto truncated reasoning traces.
+- Do not mask labels by token id when `pad_token_id == eos_token_id`. Padding labels should be `-100` because the collator writes padded label slots as `-100`, not because every label equal to the pad id is unsupervised. Otherwise EOS is removed from the objective and generation never terminates.
 
 ## Do Not Pack SFT Samples Without Attention Reset
 
@@ -32,6 +33,7 @@
 ## Recurrent LTI Defaults Must Match Loop Budget
 
 - For a fixed small recurrent budget such as 4 loops, LTI retention near `A=0.87` makes the delta path too weak at initialization. Check `1-A`, effective input/delta gains, and implied time constant against the actual loop count before treating recurrence as active.
+- When loop-depth sweeps show trained depth helps but extrapolated depth degrades, do not only rerun the same architecture. Apply the agreed recurrent contract fixes first: explicit `(h, e)` coupling, normalized coda bridge, and depth-aware diagnostics.
 
 ## Avoid Fake Adaptive Conditioning
 

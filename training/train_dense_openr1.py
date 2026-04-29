@@ -61,7 +61,8 @@ def parse_args() -> argparse.Namespace:
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--batch-size", type=int, default=4)
     evaluate.add_argument("--max-batches", type=int, default=100)
-    evaluate.add_argument("--num-workers", type=int, default=2)
+    evaluate.add_argument("--num-workers", type=int, default=4)
+    evaluate.add_argument("--prefetch-factor", type=int, default=2)
     evaluate.add_argument("--n-loops", type=int, default=None)
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
@@ -177,7 +178,7 @@ def add_data_args(
     parser.add_argument(
         "--length-bucket-mult",
         type=int,
-        default=64,
+        default=32,
         help="Mega-batch size multiplier for length bucketing.",
     )
 
@@ -187,7 +188,7 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-heads", type=int, default=24)
     parser.add_argument("--n-kv-heads", type=int, default=None)
     parser.add_argument("--prelude-layers", type=int, default=2)
-    parser.add_argument("--coda-layers", type=int, default=1)
+    parser.add_argument("--coda-layers", type=int, default=2)
     parser.add_argument("--max-loop-iters", type=int, default=4)
     parser.add_argument("--train-loops", type=int, default=None)
     parser.add_argument("--ffn-hidden-dim", type=int, default=4352)
@@ -195,11 +196,13 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rope-theta", type=float, default=500_000.0)
     parser.add_argument("--ada-norm", dest="use_ada_norm", action="store_true", default=True)
     parser.add_argument("--no-ada-norm", dest="use_ada_norm", action="store_false")
-    parser.add_argument("--lti-init-log-dt", type=float, default=-0.5)
+    parser.add_argument("--lti-init-log-dt", type=float, default=-1.0)
     parser.add_argument("--lti-init-input-gain", type=float, default=0.3)
     parser.add_argument("--lti-init-delta-gain", type=float, default=0.35)
     parser.add_argument("--lti-max-input-gain", type=float, default=1.0)
     parser.add_argument("--lti-max-delta-gain", type=float, default=1.0)
+    parser.add_argument("--recurrent-input-h-init", type=float, default=0.7)
+    parser.add_argument("--recurrent-output-h-init", type=float, default=0.75)
     parser.add_argument("--use-act", action="store_true")
     parser.add_argument("--act-threshold", type=float, default=0.99)
     parser.add_argument("--act-ponder-weight", type=float, default=0.01)
@@ -212,7 +215,7 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument(
         "--max-epochs",
@@ -245,12 +248,18 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--metrics-jsonl", type=Path, default=None)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -646,7 +655,6 @@ class PackedCausalDataset(TorchDataset):
         labels = torch.tensor(ids[1:], dtype=torch.long)
         label_mask = torch.tensor(mask[1:], dtype=torch.bool)
         labels[~label_mask] = -100
-        labels[labels == self.pad_token_id] = -100
         return {"input_ids": input_ids, "labels": labels}
 
 
@@ -840,6 +848,8 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
         "pad_to_multiple": args.pad_to_multiple,
         "length_bucketing": args.length_bucketing,
         "length_bucket_mult": args.length_bucket_mult,
+        "num_workers": args.num_workers,
+        "prefetch_factor": getattr(args, "prefetch_factor", None),
     }
     collator = CausalBatchCollator(
         pad_token_id=pad_id,
@@ -847,6 +857,16 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
         pad_to_multiple=args.pad_to_multiple,
         static_padding=args.static_padding,
     )
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": collator,
+    }
+    if args.num_workers > 0:
+        if getattr(args, "prefetch_factor", 2) <= 0:
+            raise ValueError("--prefetch-factor must be positive when num_workers > 0")
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = getattr(args, "prefetch_factor", 2)
 
     if args.length_bucketing:
         train_sampler = LengthGroupedBatchSampler(
@@ -859,27 +879,21 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
         train_loader = DataLoader(
             train_ds,
             batch_sampler=train_sampler,
-            num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=collator,
+            **loader_kwargs,
         )
     else:
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
             drop_last=True,
-            collate_fn=collator,
+            **loader_kwargs,
         )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=collator,
+        **loader_kwargs,
     )
     return train_loader, val_loader
 
@@ -903,6 +917,8 @@ def make_model_config(args: argparse.Namespace, tokenizer) -> DenseLMConfig:
         lti_init_delta_gain=args.lti_init_delta_gain,
         lti_max_input_gain=args.lti_max_input_gain,
         lti_max_delta_gain=args.lti_max_delta_gain,
+        recurrent_input_h_init=args.recurrent_input_h_init,
+        recurrent_output_h_init=args.recurrent_output_h_init,
         use_act=args.use_act,
         act_threshold=args.act_threshold,
         act_ponder_weight=args.act_ponder_weight,
@@ -968,6 +984,69 @@ def sync_scheduler_to_step(
     for group, lr in zip(scheduler.optimizer.param_groups, lrs):
         group["lr"] = lr
     scheduler._last_lr = lrs
+
+
+def parameter_uses_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
+    if not param.requires_grad:
+        return False
+    if param.ndim < 2:
+        return False
+    no_decay_fragments = (
+        "embed",
+        "lm_head",
+        "norm",
+        "injection",
+        "raw_h_gate",
+    )
+    return not any(fragment in name for fragment in no_decay_fragments)
+
+
+def make_optimizer(
+    model: OpenMythosDenseLM,
+    args: argparse.Namespace,
+) -> tuple[torch.optim.Optimizer, dict[str, Any]]:
+    decay_params: list[torch.nn.Parameter] = []
+    no_decay_params: list[torch.nn.Parameter] = []
+    decay_param_count = 0
+    no_decay_param_count = 0
+    decay_names: list[str] = []
+    no_decay_names: list[str] = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if parameter_uses_weight_decay(name, param):
+            decay_params.append(param)
+            decay_param_count += param.numel()
+            if len(decay_names) < 8:
+                decay_names.append(name)
+        else:
+            no_decay_params.append(param)
+            no_decay_param_count += param.numel()
+            if len(no_decay_names) < 8:
+                no_decay_names.append(name)
+
+    param_groups: list[dict[str, Any]] = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": args.weight_decay})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=args.lr,
+        betas=(0.9, 0.95),
+    )
+    stats = {
+        "weight_decay": args.weight_decay,
+        "decay_param_count": decay_param_count,
+        "no_decay_param_count": no_decay_param_count,
+        "decay_group_count": len(decay_params),
+        "no_decay_group_count": len(no_decay_params),
+        "decay_examples": decay_names,
+        "no_decay_examples": no_decay_names,
+    }
+    return optimizer, stats
 
 
 def save_checkpoint(
@@ -1164,6 +1243,9 @@ def evaluate(
             "lti_delta_gain_abs_max",
             "lti_effective_input_abs_max",
             "lti_effective_delta_abs_max",
+            "recurrent_input_mixer_h_gate_mean",
+            "recurrent_output_bridge_h_gate_mean",
+            "recurrent_coda_input_rms",
             "act_loss",
             "act_ponder_loss",
             "act_expected_steps",
@@ -1203,16 +1285,10 @@ def train(args: argparse.Namespace) -> None:
 
     cfg = make_model_config(args, tokenizer)
     model = OpenMythosDenseLM(cfg).to(device)
-    if args.compile:
-        model = torch.compile(model)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
-    )
+    optimizer, optimizer_stats = make_optimizer(model, args)
     scheduler = make_lr_scheduler(optimizer, args)
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode)
 
     start_step = 0
     if args.resume is not None:
@@ -1267,6 +1343,10 @@ def train(args: argparse.Namespace) -> None:
         "pad_to_multiple": args.pad_to_multiple,
         "length_bucketing": args.length_bucketing,
         "length_bucket_mult": args.length_bucket_mult,
+        "num_workers": args.num_workers,
+        "prefetch_factor": args.prefetch_factor,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode if args.compile else None,
         "dim": cfg.dim,
         "n_heads": cfg.n_heads,
         "ffn_hidden_dim": cfg.resolved_ffn_hidden_dim(),
@@ -1274,8 +1354,11 @@ def train(args: argparse.Namespace) -> None:
         "coda_layers": cfg.coda_layers,
         "max_loop_iters": cfg.max_loop_iters,
         "train_loops": args.train_loops,
+        "recurrent_input_h_init": cfg.recurrent_input_h_init,
+        "recurrent_output_h_init": cfg.recurrent_output_h_init,
         "use_ada_norm": cfg.use_ada_norm,
         "use_act": cfg.use_act,
+        "optimizer": optimizer_stats,
         "lr_schedule": args.lr_schedule,
         "base_lr": args.lr,
         "min_lr": args.lr * args.min_lr_ratio,
@@ -1426,6 +1509,9 @@ def train(args: argparse.Namespace) -> None:
                     "lti_delta_gain_abs_max",
                     "lti_effective_input_abs_max",
                     "lti_effective_delta_abs_max",
+                    "recurrent_input_mixer_h_gate_mean",
+                    "recurrent_output_bridge_h_gate_mean",
+                    "recurrent_coda_input_rms",
                     "act_ponder_loss",
                     "act_expected_steps",
                     "act_hard_steps",
@@ -1441,6 +1527,18 @@ def train(args: argparse.Namespace) -> None:
                         round(float(x), 6)
                         for x in stats["recurrent_loop_rms"].detach().cpu()
                     ]
+                for stat_key, log_key in (
+                    ("recurrent_mixed_rms", "mixed_rms"),
+                    ("recurrent_delta_rms", "delta_rms"),
+                    ("recurrent_drive_rms", "drive_rms"),
+                    ("recurrent_h_e_cosine", "h_e_cosine"),
+                    ("recurrent_h_delta_cosine", "h_delta_cosine"),
+                ):
+                    if stats.get(stat_key) is not None:
+                        log[log_key] = [
+                            round(float(x), 6)
+                            for x in stats[stat_key].detach().cpu()
+                        ]
             print(json.dumps(log, ensure_ascii=False), flush=True)
             append_jsonl(metrics_path, {"event": "train", **log})
             running_loss = 0.0
