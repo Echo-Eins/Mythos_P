@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from open_mythos.dense_lm import DenseLMConfig, OpenMythosDenseLM
 from open_mythos.modules import add_loop_index_embedding
@@ -75,6 +76,25 @@ def test_recurrent_mixers_start_with_configured_gates():
         torch.tensor(0.75),
         atol=1e-5,
     )
+
+
+def test_no_act_config_does_not_allocate_unused_act_parameters():
+    model = OpenMythosDenseLM(tiny_config())
+    names = [name for name, _ in model.named_parameters()]
+    assert not any(name.startswith("recurrent.act.") for name in names)
+    assert not any(name.startswith("recurrent.act_norm.") for name in names)
+
+
+def test_config_rejects_invalid_attention_counts():
+    cfg = tiny_config()
+    cfg.n_heads = 0
+    with pytest.raises(ValueError, match="n_heads"):
+        OpenMythosDenseLM(cfg)
+
+    cfg = tiny_config()
+    cfg.n_kv_heads = 0
+    with pytest.raises(ValueError, match="n_kv_heads"):
+        OpenMythosDenseLM(cfg)
 
 
 def test_loop_index_embedding_matches_legacy_layout():

@@ -305,3 +305,22 @@
 - `torch.compile` supports `--compile-mode`, defaulting to `reduce-overhead` when `--compile` is passed.
 - Tests were extended for mixer/bridge diagnostics and configured gate initialization.
 - Verified syntax with `py -3 -m py_compile open_mythos/dense_lm.py training/train_dense_openr1.py tests/test_dense_lm.py`.
+
+# Fresh Training And Architecture Audit
+
+- [x] Re-read project rules and lessons before touching code.
+- [x] Audit `open_mythos/dense_lm.py` and relevant `open_mythos/modules.py` blocks from scratch.
+- [x] Audit `training/train_dense_openr1.py` data, labels, loaders, optimizer, scheduler, eval, generation, checkpoint, and CLI defaults from scratch.
+- [x] Search for known long-run failure classes: EOS masking, path JSON serialization, stale checkpoint compatibility, unused CLI flags, missing startup logging, silent sample truncation, pad/label leakage, and DataLoader defaults.
+- [x] Fix any blocker found and add preflight/smoke safeguards before the next hour-long run.
+- [x] Run local no-torch verification and document remaining Spark-side checks.
+
+## Fresh Audit Review
+
+- Added a `preflight` subcommand to `training/train_dense_openr1.py` that checks real OpenR1 batches, label ranges, padded labels, supervised EOS targets, model construction, optimizer groups, forward loss, backward/grad norm, short eval, short greedy generation, and optional save/load before a long Spark run.
+- Strengthened run argument validation so bad `batch-size`, `grad-accum`, `log/eval/save` intervals, loader settings, LR, weight decay, and gradient clipping fail before dataset/model work.
+- Strengthened `DenseLMConfig.validate()` so invalid `n_heads`, `n_kv_heads`, dropout, RoPE theta, norm epsilon, and init std fail cleanly instead of later shape/division errors.
+- Fixed `torch.compile` training grad clipping to clip the base model parameters instead of the wrapper object.
+- Removed unused ACT trainable parameters from no-ACT models and made old no-ACT checkpoint ACT keys explicitly ignored with a compatibility warning.
+- Added regression tests for EOS labels when `pad_token_id == eos_token_id`, invalid attention counts, and no-ACT parameter hygiene.
+- Verified local syntax with `py -3 -m py_compile open_mythos\dense_lm.py training\train_dense_openr1.py tests\test_dense_lm.py tests\test_dynamic_padding.py`; runtime torch tests remain Spark-side because this Windows machine intentionally has no torch runtime.

@@ -86,18 +86,31 @@ class DenseLMConfig:
             raise ValueError("vocab_size must be positive")
         if self.dim <= 0:
             raise ValueError("dim must be positive")
+        if self.n_heads <= 0:
+            raise ValueError("n_heads must be positive")
         if self.dim % self.n_heads != 0:
             raise ValueError("dim must be divisible by n_heads")
         if (self.dim // self.n_heads) % 2 != 0:
             raise ValueError("attention head_dim must be even for RoPE")
-        if self.n_kv_heads is not None and self.n_heads % self.n_kv_heads != 0:
-            raise ValueError("n_kv_heads must divide n_heads")
+        if self.n_kv_heads is not None:
+            if self.n_kv_heads <= 0:
+                raise ValueError("n_kv_heads must be positive")
+            if self.n_heads % self.n_kv_heads != 0:
+                raise ValueError("n_kv_heads must divide n_heads")
         if self.prelude_layers < 0 or self.coda_layers < 0:
             raise ValueError("prelude_layers and coda_layers must be non-negative")
         if self.ffn_hidden_dim is not None and self.ffn_hidden_dim <= 0:
             raise ValueError("ffn_hidden_dim must be positive")
         if self.loop_dim is not None and self.loop_dim <= 0:
             raise ValueError("loop_dim must be positive")
+        if not (0.0 <= self.dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
+        if self.rope_theta <= 0.0:
+            raise ValueError("rope_theta must be positive")
+        if self.norm_eps <= 0.0:
+            raise ValueError("norm_eps must be positive")
+        if self.init_std <= 0.0:
+            raise ValueError("init_std must be positive")
         if self.max_loop_iters <= 0:
             raise ValueError("max_loop_iters must be positive")
         if self.max_seq_len <= 1:
@@ -272,8 +285,8 @@ class DenseRecurrentCore(nn.Module):
             max_input_gain=cfg.lti_max_input_gain,
             max_delta_gain=cfg.lti_max_delta_gain,
         )
-        self.act_norm = self._make_norm()
-        self.act = ACTHalting(cfg.dim)
+        self.act_norm = self._make_norm() if cfg.use_act else None
+        self.act = ACTHalting(cfg.dim) if cfg.use_act else None
 
     def _make_norm(self) -> nn.Module:
         if self.cfg.use_ada_norm:
@@ -336,6 +349,8 @@ class DenseRecurrentCore(nn.Module):
                 loop_rms.append(h.float().pow(2).mean().sqrt().detach())
 
             if accumulator is not None and loop_index >= act_start_loop:
+                if self.act is None or self.act_norm is None:
+                    raise RuntimeError("ACT accumulator is enabled but ACT modules are missing")
                 halt_p = self.act(self.act_norm(h, norm_cond))
                 act_out, act_weight = accumulator.step(
                     h,

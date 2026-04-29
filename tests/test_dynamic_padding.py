@@ -35,6 +35,30 @@ def test_dynamic_collator_right_pads_and_masks_labels():
     assert torch.equal(batch["labels"][0], torch.tensor([11, 12, 2, -100]))
 
 
+def test_eos_label_is_preserved_when_pad_equals_eos():
+    ds = PackedCausalDataset(
+        [
+            TokenSequence(ids=[10, 11, 2], label_mask=[0, 1, 1]),
+            TokenSequence(ids=[20, 21, 22, 2], label_mask=[0, 1, 1, 1]),
+        ],
+        seq_len=8,
+        pad_token_id=2,
+        pack_samples=False,
+    )
+    collate = CausalBatchCollator(
+        pad_token_id=2,
+        max_seq_len=8,
+        pad_to_multiple=4,
+        static_padding=False,
+    )
+
+    batch = collate([ds[0], ds[1]])
+
+    assert batch["input_ids"][0].tolist() == [10, 11, 2, 2]
+    assert batch["labels"][0].tolist() == [11, 2, -100, -100]
+    assert batch["labels"][1].tolist() == [21, 22, 2, -100]
+
+
 def test_dynamic_collator_caps_alignment_at_max_seq_len():
     ds = PackedCausalDataset(
         [TokenSequence(ids=list(range(10)), label_mask=[1] * 10)],

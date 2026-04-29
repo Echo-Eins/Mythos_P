@@ -56,6 +56,37 @@ def parse_args() -> argparse.Namespace:
     add_model_args(train)
     add_training_args(train)
 
+    preflight = sub.add_parser(
+        "preflight",
+        help="Run a fast Spark-side data/model/train smoke check before a long run",
+    )
+    add_data_args(
+        preflight,
+        tokenizer_default="Qwen/Qwen2.5-1.5B",
+        max_samples_default=64,
+    )
+    add_model_args(preflight)
+    add_training_args(preflight)
+    preflight.add_argument("--probe-batches", type=int, default=4)
+    preflight.add_argument("--generate-tokens", type=int, default=4)
+    preflight.add_argument("--check-save-load", action="store_true")
+    preflight.add_argument(
+        "--no-backward",
+        dest="run_backward",
+        action="store_false",
+        help="Skip backward/optimizer smoke step.",
+    )
+    preflight.set_defaults(
+        out_dir=Path("runs") / "dense_openr1_preflight",
+        batch_size=2,
+        grad_accum=1,
+        max_steps=2,
+        eval_batches=2,
+        num_workers=0,
+        log_every=1,
+        run_backward=True,
+    )
+
     evaluate = sub.add_parser("eval", help="Evaluate a checkpoint")
     add_data_args(evaluate, tokenizer_default=None)
     evaluate.add_argument("--checkpoint", type=Path, required=True)
@@ -268,6 +299,46 @@ def dtype_from_name(name: str) -> torch.dtype:
     if name == "fp16":
         return torch.float16
     return torch.float32
+
+
+def validate_loader_args(args: argparse.Namespace) -> None:
+    if args.max_seq_len <= 1:
+        raise ValueError("--max-seq-len must be > 1")
+    if args.max_samples is not None and args.max_samples <= 0:
+        raise ValueError("--max-samples must be positive when provided")
+    if not (0.0 < args.val_fraction < 1.0):
+        raise ValueError("--val-fraction must be in (0, 1)")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if getattr(args, "prefetch_factor", 2) <= 0:
+        raise ValueError("--prefetch-factor must be positive")
+    if args.pad_to_multiple <= 0:
+        raise ValueError("--pad-to-multiple must be positive")
+    if args.length_bucket_mult <= 0:
+        raise ValueError("--length-bucket-mult must be positive")
+
+
+def validate_training_runtime_args(args: argparse.Namespace) -> None:
+    if args.grad_accum <= 0:
+        raise ValueError("--grad-accum must be positive")
+    if args.max_steps <= 0:
+        raise ValueError("--max-steps must be positive")
+    if args.eval_every <= 0:
+        raise ValueError("--eval-every must be positive")
+    if args.save_every <= 0:
+        raise ValueError("--save-every must be positive")
+    if args.eval_batches <= 0:
+        raise ValueError("--eval-batches must be positive")
+    if args.log_every <= 0:
+        raise ValueError("--log-every must be positive")
+    if args.lr <= 0.0:
+        raise ValueError("--lr must be positive")
+    if args.weight_decay < 0.0:
+        raise ValueError("--weight-decay must be non-negative")
+    if args.grad_clip <= 0.0:
+        raise ValueError("--grad-clip must be positive")
 
 
 def load_tokenizer(tokenizer_id: str):
@@ -805,6 +876,7 @@ def dataset_length_stats(ds: PackedCausalDataset) -> dict[str, float | int]:
 
 
 def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, DataLoader]:
+    validate_loader_args(args)
     raw = load_openr1_dataset(args)
     sequences, data_stats = build_token_sequences(
         raw,
@@ -1097,20 +1169,24 @@ def load_model_state_compat(model: OpenMythosDenseLM, state: dict[str, torch.Ten
     allowed_missing = {
         name for name in missing if name.endswith("injection.raw_delta_gain")
     }
+    allowed_unexpected = {
+        name
+        for name in unexpected
+        if not model.cfg.use_act
+        and (name.startswith("recurrent.act.") or name.startswith("recurrent.act_norm."))
+    }
     real_missing = [name for name in missing if name not in allowed_missing]
-    if real_missing or unexpected:
-        details = {"missing": real_missing, "unexpected": list(unexpected)}
+    real_unexpected = [name for name in unexpected if name not in allowed_unexpected]
+    if real_missing or real_unexpected:
+        details = {"missing": real_missing, "unexpected": real_unexpected}
         raise RuntimeError(f"checkpoint state is incompatible: {json.dumps(details)}")
-    if allowed_missing:
-        print(
-            json.dumps(
-                {
-                    "checkpoint_warning": "initialized new LTI delta gain parameters",
-                    "missing": sorted(allowed_missing),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
+    if allowed_missing or allowed_unexpected:
+        print_json(
+            {
+                "checkpoint_warning": "checkpoint loaded with compatible state differences",
+                "missing_initialized": sorted(allowed_missing),
+                "unexpected_ignored": sorted(allowed_unexpected),
+            }
         )
 
 
@@ -1157,6 +1233,10 @@ def append_jsonl(path: Optional[Path], payload: dict[str, Any]) -> None:
     event = {"time": time.time(), **payload}
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(json_safe(event), ensure_ascii=False) + "\n")
+
+
+def print_json(payload: dict[str, Any], *, indent: Optional[int] = None) -> None:
+    print(json.dumps(json_safe(payload), ensure_ascii=False, indent=indent), flush=True)
 
 
 def epoch_metrics(
@@ -1260,9 +1340,282 @@ def evaluate(
     return metrics
 
 
+def validate_training_batch(
+    batch: dict[str, torch.Tensor],
+    tokenizer,
+    *,
+    vocab_size: int,
+    context: str,
+) -> dict[str, Any]:
+    input_ids = batch.get("input_ids")
+    labels = batch.get("labels")
+    seq_lens = batch.get("seq_lens")
+    if input_ids is None or labels is None:
+        raise ValueError(f"{context}: batch must contain input_ids and labels")
+    if input_ids.ndim != 2 or labels.ndim != 2:
+        raise ValueError(f"{context}: input_ids and labels must have shape (B, T)")
+    if input_ids.shape != labels.shape:
+        raise ValueError(f"{context}: input_ids and labels shapes differ")
+    if input_ids.shape[0] <= 0 or input_ids.shape[1] <= 0:
+        raise ValueError(f"{context}: empty batch shape {tuple(input_ids.shape)}")
+
+    if input_ids.min().item() < 0 or input_ids.max().item() >= vocab_size:
+        raise ValueError(f"{context}: input_ids contain ids outside tokenizer vocab")
+
+    supervised = labels[labels != -100]
+    if supervised.numel() == 0:
+        raise ValueError(f"{context}: zero supervised labels")
+    if supervised.min().item() < 0 or supervised.max().item() >= vocab_size:
+        raise ValueError(f"{context}: supervised labels contain ids outside tokenizer vocab")
+
+    if seq_lens is not None:
+        if seq_lens.ndim != 1 or seq_lens.shape[0] != input_ids.shape[0]:
+            raise ValueError(f"{context}: seq_lens must have shape (B,)")
+        seq_values = [int(x) for x in seq_lens.tolist()]
+        if min(seq_values) <= 0 or max(seq_values) > input_ids.shape[1]:
+            raise ValueError(f"{context}: seq_lens values are outside padded batch length")
+        pad_id = tokenizer.pad_token_id
+        for row_idx, seq_len in enumerate(seq_values):
+            if seq_len < input_ids.shape[1]:
+                if not torch.equal(
+                    labels[row_idx, seq_len:],
+                    torch.full_like(labels[row_idx, seq_len:], -100),
+                ):
+                    raise ValueError(f"{context}: padded label positions are not -100")
+                if pad_id is not None and not torch.equal(
+                    input_ids[row_idx, seq_len:],
+                    torch.full_like(input_ids[row_idx, seq_len:], int(pad_id)),
+                ):
+                    raise ValueError(f"{context}: padded input positions do not use pad_token_id")
+    else:
+        seq_values = [input_ids.shape[1]] * input_ids.shape[0]
+
+    eos_id = tokenizer.eos_token_id
+    eos_targets = int((supervised == eos_id).sum().item()) if eos_id is not None else 0
+    return {
+        "batch_size": int(input_ids.shape[0]),
+        "padded_seq_len": int(input_ids.shape[1]),
+        "min_seq_len": min(seq_values),
+        "max_seq_len": max(seq_values),
+        "real_input_tokens": int(sum(seq_values)),
+        "padded_input_tokens": int(input_ids.numel()),
+        "supervised_tokens": int(supervised.numel()),
+        "supervised_eos_tokens": eos_targets,
+        "eos_is_pad": bool(eos_id is not None and eos_id == tokenizer.pad_token_id),
+    }
+
+
+def probe_training_batches(
+    loader: DataLoader,
+    tokenizer,
+    *,
+    vocab_size: int,
+    max_batches: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    if max_batches <= 0:
+        raise ValueError("--probe-batches must be positive")
+
+    first_batch: Optional[dict[str, torch.Tensor]] = None
+    aggregate = {
+        "batches": 0,
+        "real_input_tokens": 0,
+        "padded_input_tokens": 0,
+        "supervised_tokens": 0,
+        "supervised_eos_tokens": 0,
+        "min_seq_len": None,
+        "max_seq_len": 0,
+        "max_padded_seq_len": 0,
+    }
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        if first_batch is None:
+            first_batch = batch
+        stats = validate_training_batch(
+            batch,
+            tokenizer,
+            vocab_size=vocab_size,
+            context=f"preflight batch {batch_idx}",
+        )
+        aggregate["batches"] += 1
+        aggregate["real_input_tokens"] += stats["real_input_tokens"]
+        aggregate["padded_input_tokens"] += stats["padded_input_tokens"]
+        aggregate["supervised_tokens"] += stats["supervised_tokens"]
+        aggregate["supervised_eos_tokens"] += stats["supervised_eos_tokens"]
+        aggregate["min_seq_len"] = (
+            stats["min_seq_len"]
+            if aggregate["min_seq_len"] is None
+            else min(int(aggregate["min_seq_len"]), stats["min_seq_len"])
+        )
+        aggregate["max_seq_len"] = max(int(aggregate["max_seq_len"]), stats["max_seq_len"])
+        aggregate["max_padded_seq_len"] = max(
+            int(aggregate["max_padded_seq_len"]),
+            stats["padded_seq_len"],
+        )
+
+    if first_batch is None or aggregate["batches"] == 0:
+        raise ValueError("preflight could not read any training batches")
+    aggregate["padding_efficiency"] = aggregate["real_input_tokens"] / max(
+        1,
+        aggregate["padded_input_tokens"],
+    )
+    aggregate["supervised_eos_fraction"] = aggregate["supervised_eos_tokens"] / max(
+        1,
+        aggregate["supervised_tokens"],
+    )
+    if tokenizer.eos_token_id is not None and aggregate["supervised_eos_tokens"] == 0:
+        raise RuntimeError(
+            "preflight found zero supervised EOS labels. This usually means EOS "
+            "is being masked out; do not start a long generation run until fixed."
+        )
+    return first_batch, aggregate
+
+
+def preflight_cmd(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    validate_training_runtime_args(args)
+    if args.tokenizer is None:
+        raise ValueError("preflight requires --tokenizer")
+    if args.generate_tokens < 0:
+        raise ValueError("--generate-tokens must be non-negative")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = args.metrics_jsonl or (args.out_dir / "preflight_metrics.jsonl")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dtype = dtype_from_name(args.dtype)
+    autocast_enabled = device.type == "cuda" and dtype != torch.float32
+
+    tokenizer = load_tokenizer(args.tokenizer)
+    train_loader, val_loader = build_loaders(args, tokenizer)
+    first_batch, label_probe = probe_training_batches(
+        train_loader,
+        tokenizer,
+        vocab_size=len(tokenizer),
+        max_batches=args.probe_batches,
+    )
+    cfg = make_model_config(args, tokenizer)
+    base_model = OpenMythosDenseLM(cfg).to(device)
+    optimizer, optimizer_stats = make_optimizer(base_model, args)
+    scheduler = make_lr_scheduler(optimizer, args)
+    model = base_model
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode)
+
+    start_payload = {
+        "event": "preflight_start",
+        "params": base_model.num_parameters(),
+        "parameter_breakdown": base_model.parameter_breakdown(),
+        "train_batches": len(train_loader),
+        "val_batches": len(val_loader),
+        "data": getattr(args, "data_stats", None),
+        "label_probe": label_probe,
+        "optimizer": optimizer_stats,
+        "device": str(device),
+        "dtype": args.dtype,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode if args.compile else None,
+        "config": asdict(cfg),
+    }
+    print_json(start_payload, indent=2)
+    append_jsonl(metrics_path, start_payload)
+
+    batch = move_batch(first_batch, device)
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+        out = model(
+            batch["input_ids"],
+            labels=batch["labels"],
+            n_loops=args.train_loops,
+            collect_stats=True,
+        )
+    if out.loss is None:
+        raise RuntimeError("preflight forward returned no loss")
+    if not bool(torch.isfinite(out.loss.detach()).item()):
+        raise RuntimeError("preflight forward returned a non-finite loss")
+
+    grad_norm_value: Optional[float] = None
+    if args.run_backward:
+        out.loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
+        if not bool(torch.isfinite(grad_norm.detach()).item()):
+            raise RuntimeError("preflight backward produced a non-finite grad norm")
+        grad_norm_value = float(grad_norm.detach().cpu())
+        optimizer.step()
+        scheduler.step()
+
+    eval_metrics = evaluate(
+        model,
+        val_loader,
+        device=device,
+        dtype=dtype,
+        n_loops=args.train_loops,
+        max_batches=args.eval_batches,
+    )
+
+    generated_shape: Optional[list[int]] = None
+    if args.generate_tokens > 0:
+        seq_len = int(batch["seq_lens"][0].item()) if "seq_lens" in batch else batch["input_ids"].shape[1]
+        prompt_len = max(1, min(seq_len, cfg.max_seq_len))
+        generated = model.generate(
+            batch["input_ids"][:1, :prompt_len],
+            max_new_tokens=args.generate_tokens,
+            n_loops=args.train_loops,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        generated_shape = [int(x) for x in generated.shape]
+
+    checkpoint_path: Optional[Path] = None
+    if args.check_save_load:
+        checkpoint_path = args.out_dir / "preflight.pt"
+        save_checkpoint(
+            checkpoint_path,
+            model=base_model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=1 if args.run_backward else 0,
+            tokenizer_id=args.tokenizer,
+            args=args,
+        )
+        reloaded, _ = load_checkpoint(checkpoint_path, device=device, dtype=dtype)
+        reloaded.eval()
+
+    summary = {
+        "event": "preflight_ok",
+        "loss": float(out.loss.detach().cpu()),
+        "lm_loss": scalar_stat(out.stats, "lm_loss") if out.stats is not None else None,
+        "grad_norm": grad_norm_value,
+        "lr_after_step": scheduler.get_last_lr()[0],
+        "eval": eval_metrics,
+        "generated_shape": generated_shape,
+        "checkpoint_path": checkpoint_path,
+    }
+    if out.stats is not None:
+        for key in (
+            "lti_A_min",
+            "lti_A_max",
+            "lti_tau_min",
+            "lti_tau_max",
+            "lti_input_gain_abs_max",
+            "lti_delta_gain_abs_max",
+            "lti_effective_input_abs_max",
+            "lti_effective_delta_abs_max",
+            "recurrent_input_mixer_h_gate_mean",
+            "recurrent_output_bridge_h_gate_mean",
+            "recurrent_coda_input_rms",
+        ):
+            value = scalar_stat(out.stats, key)
+            if value is not None:
+                summary[key] = value
+    print_json(summary, indent=2)
+    append_jsonl(metrics_path, summary)
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    validate_training_runtime_args(args)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dtype = dtype_from_name(args.dtype)
     autocast_enabled = device.type == "cuda" and dtype != torch.float32
@@ -1365,7 +1718,7 @@ def train(args: argparse.Namespace) -> None:
         "decay_steps": args.decay_steps or args.max_steps,
         "config": asdict(cfg),
     }
-    print(json.dumps(startup_payload, ensure_ascii=False, indent=2), flush=True)
+    print_json(startup_payload, indent=2)
     append_jsonl(metrics_path, startup_payload)
 
     data_iter = iter(train_loader)
@@ -1411,7 +1764,7 @@ def train(args: argparse.Namespace) -> None:
                             grad_accum=args.grad_accum,
                         ),
                     }
-                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                    print_json(event)
                     append_jsonl(metrics_path, event)
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
@@ -1453,7 +1806,8 @@ def train(args: argparse.Namespace) -> None:
             if out.stats is not None and (collect_micro_stats or stats is None):
                 stats = out.stats
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
 
@@ -1539,7 +1893,7 @@ def train(args: argparse.Namespace) -> None:
                             round(float(x), 6)
                             for x in stats[stat_key].detach().cpu()
                         ]
-            print(json.dumps(log, ensure_ascii=False), flush=True)
+            print_json(log)
             append_jsonl(metrics_path, {"event": "train", **log})
             running_loss = 0.0
             running_lm_loss = 0.0
@@ -1569,13 +1923,7 @@ def train(args: argparse.Namespace) -> None:
                     grad_accum=args.grad_accum,
                 ),
             }
-            print(
-                json.dumps(
-                    {key: value for key, value in eval_payload.items() if key != "event"},
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+            print_json({key: value for key, value in eval_payload.items() if key != "event"})
             append_jsonl(metrics_path, eval_payload)
             model.train()
 
@@ -1634,6 +1982,8 @@ def train(args: argparse.Namespace) -> None:
 
 
 def eval_cmd(args: argparse.Namespace) -> None:
+    if args.max_batches <= 0:
+        raise ValueError("--max-batches must be positive")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dtype = dtype_from_name(args.dtype)
     model, ckpt = load_checkpoint(args.checkpoint, device=device, dtype=dtype)
@@ -1652,11 +2002,15 @@ def eval_cmd(args: argparse.Namespace) -> None:
         n_loops=args.n_loops,
         max_batches=args.max_batches,
     )
-    print(json.dumps(metrics, ensure_ascii=False, indent=2), flush=True)
+    print_json(metrics, indent=2)
 
 
 @torch.no_grad()
 def exact_eval_cmd(args: argparse.Namespace) -> None:
+    if args.max_new_tokens < 0:
+        raise ValueError("--max-new-tokens must be non-negative")
+    if args.print_samples < 0:
+        raise ValueError("--print-samples must be non-negative")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dtype = dtype_from_name(args.dtype)
     model, ckpt = load_checkpoint(args.checkpoint, device=device, dtype=dtype)
@@ -1692,7 +2046,7 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
         "top_p": args.top_p,
         "predictions_path": args.predictions_path,
     }
-    print(json.dumps(json_safe(start_payload), ensure_ascii=False, indent=2), flush=True)
+    print_json(start_payload, indent=2)
     append_jsonl(args.metrics_jsonl, start_payload)
 
     evaluated = 0
@@ -1796,23 +2150,19 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
             )
 
             if printed < args.print_samples:
-                print(json.dumps({"sample": record}, ensure_ascii=False), flush=True)
+                print_json({"sample": record})
                 printed += 1
 
             if args.log_every > 0 and evaluated % args.log_every == 0:
-                print(
-                    json.dumps(
-                        {
-                            "evaluated": evaluated,
-                            "correct": correct,
-                            "exact_match": correct / max(1, evaluated),
-                            "eos_rate": eos_count / max(1, evaluated),
-                            "hit_max_new_tokens_rate": hit_max_count / max(1, evaluated),
-                            "avg_repeat_4gram_ratio": repeat_4gram_sum / max(1, evaluated),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
+                print_json(
+                    {
+                        "evaluated": evaluated,
+                        "correct": correct,
+                        "exact_match": correct / max(1, evaluated),
+                        "eos_rate": eos_count / max(1, evaluated),
+                        "hit_max_new_tokens_rate": hit_max_count / max(1, evaluated),
+                        "avg_repeat_4gram_ratio": repeat_4gram_sum / max(1, evaluated),
+                    }
                 )
     finally:
         if pred_fp is not None:
@@ -1832,7 +2182,7 @@ def exact_eval_cmd(args: argparse.Namespace) -> None:
         "avg_repeat_4gram_ratio": repeat_4gram_sum / max(1, evaluated),
         "avg_unique_token_ratio": unique_token_ratio_sum / max(1, evaluated),
     }
-    print(json.dumps({"exact_eval": metrics}, ensure_ascii=False, indent=2), flush=True)
+    print_json({"exact_eval": metrics}, indent=2)
     append_jsonl(args.metrics_jsonl, {"event": "exact_eval", "exact_eval": metrics})
 
 
@@ -1874,6 +2224,8 @@ def main() -> None:
     args = parse_args()
     if args.cmd == "train":
         train(args)
+    elif args.cmd == "preflight":
+        preflight_cmd(args)
     elif args.cmd == "eval":
         eval_cmd(args)
     elif args.cmd == "exact-eval":
