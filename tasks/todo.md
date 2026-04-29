@@ -350,3 +350,9 @@
 - Preflight now stores multiple probed batches and performs a weighted microbatch training step over `min(--grad-accum, --probe-batches)` batches, so compile+gradient-accumulation failures are not hidden by a one-batch smoke test.
 - Preflight generation now uses the base uncompiled model after the optimizer smoke step, keeping generation out of the compiled train-step CUDA Graph path.
 - Verified syntax with `py -3 -m py_compile training\train_dense_openr1.py`; Spark-side compile preflight must be rerun with `--grad-accum 16 --probe-batches 16` before full compile training.
+
+# Reduce-Overhead Compile Guard
+
+- [x] Treat `torch.compile(mode="reduce-overhead")` plus `grad_accum > 1` as unsupported on the current Spark torch/Inductor stack after repeated CUDA Graph output overwrite failures.
+- [x] Add fail-fast validation so long training cannot start in this unsafe mode.
+- [x] Use no-compile as the reliable path for the current serious run; test `--compile-mode default` separately only after the no-compile baseline is training.

@@ -339,6 +339,17 @@ def validate_training_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--weight-decay must be non-negative")
     if args.grad_clip <= 0.0:
         raise ValueError("--grad-clip must be positive")
+    if (
+        getattr(args, "compile", False)
+        and getattr(args, "compile_mode", None) == "reduce-overhead"
+        and args.grad_accum > 1
+    ):
+        raise ValueError(
+            "--compile-mode reduce-overhead is unsafe with --grad-accum > 1 on "
+            "the current Spark torch/Inductor stack because CUDA Graph outputs "
+            "are reused across micro-batches. Disable --compile or use "
+            "--compile-mode default after a matching preflight."
+        )
 
 
 def load_tokenizer(tokenizer_id: str):
