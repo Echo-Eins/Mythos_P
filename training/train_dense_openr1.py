@@ -1259,6 +1259,15 @@ def snapshot_tensor_outputs(value: Any) -> Any:
     return value
 
 
+def mark_compiled_model_step(model: torch.nn.Module) -> None:
+    if not hasattr(model, "_orig_mod"):
+        return
+    compiler = getattr(torch, "compiler", None)
+    marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if marker is not None:
+        marker()
+
+
 def epoch_metrics(
     *,
     micro_batches_seen: int,
@@ -1306,6 +1315,7 @@ def evaluate(
         if token_count == 0:
             continue
         batch = move_batch(batch, device)
+        mark_compiled_model_step(model)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
             out = model(
                 batch["input_ids"],
@@ -1432,11 +1442,11 @@ def probe_training_batches(
     *,
     vocab_size: int,
     max_batches: int,
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+) -> tuple[list[dict[str, torch.Tensor]], dict[str, Any]]:
     if max_batches <= 0:
         raise ValueError("--probe-batches must be positive")
 
-    first_batch: Optional[dict[str, torch.Tensor]] = None
+    probe_batches: list[dict[str, torch.Tensor]] = []
     aggregate = {
         "batches": 0,
         "real_input_tokens": 0,
@@ -1450,8 +1460,7 @@ def probe_training_batches(
     for batch_idx, batch in enumerate(loader):
         if batch_idx >= max_batches:
             break
-        if first_batch is None:
-            first_batch = batch
+        probe_batches.append(batch)
         stats = validate_training_batch(
             batch,
             tokenizer,
@@ -1474,7 +1483,7 @@ def probe_training_batches(
             stats["padded_seq_len"],
         )
 
-    if first_batch is None or aggregate["batches"] == 0:
+    if not probe_batches or aggregate["batches"] == 0:
         raise ValueError("preflight could not read any training batches")
     aggregate["padding_efficiency"] = aggregate["real_input_tokens"] / max(
         1,
@@ -1489,7 +1498,7 @@ def probe_training_batches(
             "preflight found zero supervised EOS labels. This usually means EOS "
             "is being masked out; do not start a long generation run until fixed."
         )
-    return first_batch, aggregate
+    return probe_batches, aggregate
 
 
 def preflight_cmd(args: argparse.Namespace) -> None:
@@ -1509,7 +1518,7 @@ def preflight_cmd(args: argparse.Namespace) -> None:
 
     tokenizer = load_tokenizer(args.tokenizer)
     train_loader, val_loader = build_loaders(args, tokenizer)
-    first_batch, label_probe = probe_training_batches(
+    probe_batches, label_probe = probe_training_batches(
         train_loader,
         tokenizer,
         vocab_size=len(tokenizer),
@@ -1541,26 +1550,52 @@ def preflight_cmd(args: argparse.Namespace) -> None:
     print_json(start_payload, indent=2)
     append_jsonl(metrics_path, start_payload)
 
-    batch = move_batch(first_batch, device)
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-        out = model(
-            batch["input_ids"],
-            labels=batch["labels"],
-            n_loops=args.train_loops,
-            collect_stats=True,
-        )
-    if out.loss is None:
-        raise RuntimeError("preflight forward returned no loss")
-    preflight_loss_tensor = out.loss.detach()
-    if not bool(torch.isfinite(preflight_loss_tensor).item()):
-        raise RuntimeError("preflight forward returned a non-finite loss")
-    preflight_loss = float(preflight_loss_tensor.cpu().item())
-    preflight_stats = snapshot_tensor_outputs(out.stats) if out.stats is not None else None
+    micro_batches = probe_batches[: max(1, min(args.grad_accum, len(probe_batches)))]
+    update_tokens = sum(int((batch["labels"] != -100).sum().item()) for batch in micro_batches)
+    if update_tokens <= 0:
+        raise RuntimeError("preflight microbatch update has zero supervised tokens")
+
+    first_device_batch: Optional[dict[str, torch.Tensor]] = None
+    preflight_loss = 0.0
+    preflight_lm_loss = 0.0
+    preflight_stats: Optional[dict[str, Any]] = None
 
     grad_norm_value: Optional[float] = None
+    for micro_idx, cpu_batch in enumerate(micro_batches):
+        token_count = int((cpu_batch["labels"] != -100).sum().item())
+        if token_count == 0:
+            continue
+        batch = move_batch(cpu_batch, device)
+        if first_device_batch is None:
+            first_device_batch = batch
+        mark_compiled_model_step(model)
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+            out = model(
+                batch["input_ids"],
+                labels=batch["labels"],
+                n_loops=args.train_loops,
+                collect_stats=(micro_idx == 0),
+            )
+            if out.loss is None:
+                raise RuntimeError("preflight forward returned no loss")
+            loss = out.loss * (token_count / update_tokens)
+        if not bool(torch.isfinite(loss.detach()).item()):
+            raise RuntimeError("preflight forward returned a non-finite loss")
+        preflight_loss += float(loss.detach().cpu())
+        out_stats = snapshot_tensor_outputs(out.stats) if out.stats is not None else None
+        if out_stats is not None:
+            lm_loss_value = scalar_stat(out_stats, "lm_loss")
+            if lm_loss_value is not None:
+                preflight_lm_loss += lm_loss_value * (token_count / update_tokens)
+            if preflight_stats is None:
+                preflight_stats = out_stats
+        if args.run_backward:
+            loss.backward()
+
+    if first_device_batch is None:
+        raise RuntimeError("preflight did not produce a device batch")
     if args.run_backward:
-        out.loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
         if not bool(torch.isfinite(grad_norm.detach()).item()):
             raise RuntimeError("preflight backward produced a non-finite grad norm")
@@ -1579,9 +1614,10 @@ def preflight_cmd(args: argparse.Namespace) -> None:
 
     generated_shape: Optional[list[int]] = None
     if args.generate_tokens > 0:
+        batch = first_device_batch
         seq_len = int(batch["seq_lens"][0].item()) if "seq_lens" in batch else batch["input_ids"].shape[1]
         prompt_len = max(1, min(seq_len, cfg.max_seq_len))
-        generated = model.generate(
+        generated = base_model.generate(
             batch["input_ids"][:1, :prompt_len],
             max_new_tokens=args.generate_tokens,
             n_loops=args.train_loops,
@@ -1608,9 +1644,11 @@ def preflight_cmd(args: argparse.Namespace) -> None:
     summary = {
         "event": "preflight_ok",
         "loss": preflight_loss,
-        "lm_loss": scalar_stat(preflight_stats, "lm_loss") if preflight_stats is not None else None,
+        "lm_loss": preflight_lm_loss if preflight_lm_loss > 0.0 else None,
         "grad_norm": grad_norm_value,
         "lr_after_step": scheduler.get_last_lr()[0],
+        "micro_batches": len(micro_batches),
+        "supervised_tokens": update_tokens,
         "eval": eval_metrics,
         "generated_shape": generated_shape,
         "checkpoint_path": checkpoint_path,
@@ -1807,6 +1845,7 @@ def train(args: argparse.Namespace) -> None:
         for micro, (batch, token_count) in enumerate(micro_batches):
             batch = move_batch(batch, device)
             collect_micro_stats = micro == 0 and (step + 1) % args.log_every == 0
+            mark_compiled_model_step(model)
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                 out = model(
                     batch["input_ids"],
