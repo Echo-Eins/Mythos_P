@@ -892,25 +892,34 @@ class DenseTransformerBlock(nn.Module):
 
 class LTIInjection(nn.Module):
     """
-    Stable diagonal linear-time-invariant injection.
+    Stable diagonal linear-time-invariant injection with decoupled delta path.
 
-    The intended recurrent update is:
+    Recurrent update:
 
-        h_{t+1} = A * h_t + (1 - A) * (B_e * e + B_delta * delta_t)
+        h_{t+1} = A * h_t
+                + (1 - A) * input_gain * e
+                + delta_gain * delta_normed
 
-    h_t:
-        Current recurrent hidden state.
-    e:
-        Encoded prompt/input state that is re-injected every loop.
-    delta_t:
-        Transformer-computed update for this loop, ideally output - input from
-        a residual block.
+    where delta_normed is delta rescaled to match h's local RMS so the
+    transformer residual always operates at h's magnitude, regardless of how
+    much the prelude normalization shrinks the transformer's input.
 
-    A is parameterized as exp(-exp(log_dt + log_A)), so every channel lies in
-    (0, 1).  The input and delta gains are bounded and multiplied by (1 - A).
-    This makes the discrete update an exponential moving state transition
-    rather than an unconstrained residual add.  The nonlinear transformer delta
-    can still be large, but it is now explicitly gain-limited before injection.
+    Decoupling delta from the (1-A) gate is the critical fix: in the old
+    convex-combination formula both e and delta were gated by (1-A), so a
+    slow-forgetting channel (A near 1, small 1-A) could barely be influenced
+    by the transformer at all.  Now (1-A) only applies to the input anchor e
+    (which correctly provides weak influence for slow channels) while delta
+    contributes a full-strength residual scaled to h's current magnitude.
+
+    Parameters
+    ----------
+    log_dt: per-channel (shape [dim]) so each channel can learn its own
+        time constant independently.  This replaces the old shared scalar.
+    log_A: per-channel base memory exponent.  A = exp(-exp(log_dt + log_A)).
+    input_gain, delta_gain: tanh-bounded per-channel gains with configurable
+        maximum absolute value.  delta_gain may exceed 1.0; the default
+        max_delta_gain of 4.0 allows the model to inject transformer updates
+        that are 4× the scale of the normalized delta signal.
     """
 
     def __init__(
@@ -920,9 +929,9 @@ class LTIInjection(nn.Module):
         init_log_a: float = 0.0,
         init_log_dt: float = -0.5,
         init_input_gain: float = 0.3,
-        init_delta_gain: float = 0.35,
+        init_delta_gain: float = 0.5,
         max_input_gain: float = 1.0,
-        max_delta_gain: float = 1.0,
+        max_delta_gain: float = 4.0,
     ) -> None:
         super().__init__()
         _require(max_input_gain > 0.0, "max_input_gain must be positive")
@@ -936,7 +945,8 @@ class LTIInjection(nn.Module):
             "abs(init_delta_gain) must not exceed max_delta_gain",
         )
         self.log_A = nn.Parameter(torch.full((dim,), init_log_a))
-        self.log_dt = nn.Parameter(torch.tensor(float(init_log_dt)))
+        # Per-channel log_dt for independent time constants across dimensions.
+        self.log_dt = nn.Parameter(torch.full((dim,), float(init_log_dt)))
         input_ratio = max(-0.999, min(0.999, init_input_gain / max_input_gain))
         delta_ratio = max(-0.999, min(0.999, init_delta_gain / max_delta_gain))
         self.raw_input_gain = nn.Parameter(torch.full((dim,), math.atanh(input_ratio)))
@@ -968,8 +978,21 @@ class LTIInjection(nn.Module):
         one_minus_A = (1.0 - A).clamp(min=0.0, max=1.0)
         input_gain = self.input_gain().to(dtype=h.dtype, device=h.device)
         delta_gain = self.delta_gain().to(dtype=h.dtype, device=h.device)
-        drive = input_gain.view(1, 1, -1) * e + delta_gain.view(1, 1, -1) * delta
-        return A.view(1, 1, -1) * h + one_minus_A.view(1, 1, -1) * drive
+
+        # Rescale delta to h's local RMS so the transformer residual always
+        # contributes at h's magnitude.  The scale ratio is detached so it acts
+        # as a stable normalization constant rather than an additional gradient
+        # path that could amplify unstable delta signals.
+        h_rms = h.detach().float().pow(2).mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        delta_rms = delta.detach().float().pow(2).mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        delta_normed = (delta.float() * (h_rms / delta_rms)).to(h.dtype)
+
+        # (1-A) gates only the e anchor; delta_normed is a true residual update.
+        return (
+            A.view(1, 1, -1) * h
+            + one_minus_A.view(1, 1, -1) * input_gain.view(1, 1, -1) * e
+            + delta_gain.view(1, 1, -1) * delta_normed
+        )
 
 
 # ---------------------------------------------------------------------------

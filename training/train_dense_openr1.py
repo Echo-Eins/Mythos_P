@@ -171,6 +171,17 @@ def add_data_args(
         help="Skip samples that produce fewer supervised response tokens.",
     )
     parser.add_argument(
+        "--n-eos-tokens",
+        type=int,
+        default=3,
+        help=(
+            "Number of EOS tokens appended after each response.  A single EOS "
+            "is statistically negligible (< 0.3%% of supervised tokens) so the "
+            "model cannot learn reliable termination.  3 EOS tokens raise that "
+            "signal while staying within normal sequence budgets."
+        ),
+    )
+    parser.add_argument(
         "--pack-samples",
         action="store_true",
         help=(
@@ -229,9 +240,20 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-ada-norm", dest="use_ada_norm", action="store_false")
     parser.add_argument("--lti-init-log-dt", type=float, default=-1.0)
     parser.add_argument("--lti-init-input-gain", type=float, default=0.3)
-    parser.add_argument("--lti-init-delta-gain", type=float, default=0.35)
+    parser.add_argument("--lti-init-delta-gain", type=float, default=0.5)
     parser.add_argument("--lti-max-input-gain", type=float, default=1.0)
-    parser.add_argument("--lti-max-delta-gain", type=float, default=1.0)
+    parser.add_argument("--lti-max-delta-gain", type=float, default=4.0)
+    parser.add_argument(
+        "--eos-loss-weight",
+        type=float,
+        default=0.3,
+        help=(
+            "Extra loss weight applied to EOS-token positions.  The total loss "
+            "is lm_loss + eos_loss_weight * eos_cross_entropy.  Set to 0 to "
+            "disable.  Works together with --n-eos-tokens to give the model a "
+            "strong gradient signal for learning to emit EOS."
+        ),
+    )
     parser.add_argument("--recurrent-input-h-init", type=float, default=0.7)
     parser.add_argument("--recurrent-output-h-init", type=float, default=0.75)
     parser.add_argument("--use-act", action="store_true")
@@ -597,6 +619,7 @@ def build_token_sequences(
     loss_on: str,
     long_sample_policy: str,
     min_response_tokens: int,
+    n_eos_tokens: int = 3,
 ) -> tuple[list[TokenSequence], dict[str, int]]:
     if max_samples is not None:
         max_samples = min(max_samples, len(ds))
@@ -623,7 +646,7 @@ def build_token_sequences(
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         response_ids = tokenizer.encode(response, add_special_tokens=False)
         if eos is not None:
-            response_ids.append(eos)
+            response_ids.extend([eos] * n_eos_tokens)
 
         if len(response_ids) < min_response_tokens:
             stats["dropped_short_response"] += 1
@@ -898,6 +921,7 @@ def build_loaders(args: argparse.Namespace, tokenizer) -> tuple[DataLoader, Data
         loss_on=args.loss_on,
         long_sample_policy=args.long_sample_policy,
         min_response_tokens=args.min_response_tokens,
+        n_eos_tokens=getattr(args, "n_eos_tokens", 3),
     )
     args.data_stats = data_stats
     train_seq, val_seq = split_sequences(
@@ -1009,6 +1033,8 @@ def make_model_config(args: argparse.Namespace, tokenizer) -> DenseLMConfig:
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
+        eos_loss_weight=getattr(args, "eos_loss_weight", 0.0),
+        n_eos_tokens=getattr(args, "n_eos_tokens", 1),
     )
 
 

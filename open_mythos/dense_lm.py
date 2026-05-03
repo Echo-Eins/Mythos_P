@@ -58,9 +58,9 @@ class DenseLMConfig:
     use_ada_norm: bool = True
     lti_init_log_dt: float = -1.0
     lti_init_input_gain: float = 0.3
-    lti_init_delta_gain: float = 0.35
+    lti_init_delta_gain: float = 0.5
     lti_max_input_gain: float = 1.0
-    lti_max_delta_gain: float = 1.0
+    lti_max_delta_gain: float = 4.0
     recurrent_input_h_init: float = 0.7
     recurrent_output_h_init: float = 0.75
     tie_embeddings: bool = True
@@ -72,6 +72,8 @@ class DenseLMConfig:
     pad_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
     bos_token_id: Optional[int] = None
+    eos_loss_weight: float = 0.0
+    n_eos_tokens: int = 1
 
     def resolved_ffn_hidden_dim(self) -> int:
         if self.ffn_hidden_dim is not None:
@@ -135,6 +137,10 @@ class DenseLMConfig:
             raise ValueError("act_min_steps must be positive")
         if self.act_min_steps > self.max_loop_iters:
             raise ValueError("act_min_steps cannot exceed max_loop_iters")
+        if self.eos_loss_weight < 0.0:
+            raise ValueError("eos_loss_weight must be non-negative")
+        if self.n_eos_tokens < 1:
+            raise ValueError("n_eos_tokens must be at least 1")
 
 
 def dense_lm_config_from_dict(data: dict[str, Any]) -> DenseLMConfig:
@@ -405,7 +411,7 @@ class DenseRecurrentCore(nn.Module):
                         "lti_input_gain_abs_max": input_gain.abs().max(),
                         "lti_delta_gain_abs_max": delta_gain.abs().max(),
                         "lti_effective_input_abs_max": (retention * input_gain).abs().max(),
-                        "lti_effective_delta_abs_max": (retention * delta_gain).abs().max(),
+                        "lti_effective_delta_abs_max": delta_gain.abs().max(),
                     }
                 )
             if accumulator is not None:
@@ -600,6 +606,25 @@ class OpenMythosDenseLM(nn.Module):
             )
             loss = lm_loss
             stats["lm_loss"] = lm_loss.detach()
+
+            if self.cfg.eos_loss_weight > 0.0 and self.cfg.eos_token_id is not None:
+                # Upweight EOS positions: the model must learn to emit EOS at the
+                # right time.  With response-only loss and typically one EOS per
+                # sequence, EOS positions are a tiny fraction of supervised tokens
+                # (< 1%).  A separate EOS cross-entropy term with its own weight
+                # raises the effective gradient signal on those positions without
+                # altering the rest of the loss landscape.
+                flat_labels = labels.view(-1)
+                eos_mask = flat_labels == self.cfg.eos_token_id
+                if eos_mask.any():
+                    eos_loss = F.cross_entropy(
+                        logits.view(-1, self.cfg.vocab_size)[eos_mask],
+                        flat_labels[eos_mask],
+                    )
+                    loss = loss + self.cfg.eos_loss_weight * eos_loss
+                    stats["eos_loss"] = eos_loss.detach()
+                    stats["eos_token_count"] = eos_mask.sum().detach()
+
             if self.cfg.use_act and self.cfg.act_ponder_weight > 0.0:
                 if stats is None or "act_ponder_loss" not in stats:
                     raise RuntimeError("ACT is enabled but recurrent core returned no ponder loss")
